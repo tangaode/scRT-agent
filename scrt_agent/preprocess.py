@@ -194,6 +194,7 @@ def _read_10x_sample(sample: SampleFiles) -> ad.AnnData:
         adata.var["feature_type"] = features["feature_type"].astype(str).to_numpy()
     adata.var_names = pd.Index(adata.var["gene_name"].astype(str))
     adata.var_names_make_unique()
+    adata.var_names.name = None
     adata.obs_names = pd.Index([f"{sample.sample_key}:{barcode}" for barcode in barcodes])
     adata.obs["barcode"] = barcodes
     adata.obs["sample_key"] = sample.sample_key
