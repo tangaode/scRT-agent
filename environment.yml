@@ -1,0 +1,25 @@
+name: scrt-agent-v2
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - anndata
+  - scanpy
+  - jupyter_client
+  - nbformat
+  - ipykernel
+  - python-dotenv
+  - pip:
+      - openai
+      - litellm
+      - instructor
+      - scirpy

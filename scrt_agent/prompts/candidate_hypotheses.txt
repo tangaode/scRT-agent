@@ -1,0 +1,40 @@
+Propose a short ranked menu of candidate hypotheses for this scRNA + scTCR project before any notebook execution begins.
+
+Return a structured `CandidateHypothesisMenu` with:
+- `research_focus`
+- `candidates`
+
+Requirements:
+- Return 3 to 5 candidate hypotheses.
+- Favor hypotheses that are scientifically meaningful, dataset-feasible, and easy for a user to compare.
+- Do not assume the user wants literature-inspired questions unless the literature summary clearly helps.
+- If the research brief already points to a preferred direction, make that visible in the ranking.
+- Each `first_test` should describe a concrete first notebook step, not vague future work.
+- Keep caveats realistic and tied to the actual data.
+
+RNA summary:
+{rna_summary}
+
+TCR summary:
+{tcr_summary}
+
+Joint summary:
+{joint_summary}
+
+Validation summary:
+{validation_summary}
+
+Research state:
+{research_state}
+
+Literature summary:
+{literature_summary}
+
+Literature-derived hypothesis candidates:
+{literature_candidates_summary}
+
+Research brief:
+{context_summary}
+
+Past analyses:
+{past_analyses}

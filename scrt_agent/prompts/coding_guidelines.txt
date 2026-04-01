@@ -1,0 +1,37 @@
+Available Python packages: {AVAILABLE_PACKAGES}
+
+Notebook state and data contract:
+- `adata_rna` is the primary object for transcriptomic analysis.
+- `tcr_df` is the raw or normalized TCR annotation table.
+- The setup cell merges TCR information onto `adata_rna.obs`.
+- The following fields should usually be available on `adata_rna.obs`: `barcode`, `barcode_core`, `clonotype_id`, `chain`, `cdr3`, `v_gene`, `j_gene`, `productive_any`, `tcr_chain_count`, `tcr_reads`, `has_tcr`, `clone_size`, `expanded_clone`, `singleton_clone`, `small_clone`.
+- Some fields may contain missing values. Check before analysis.
+- The setup cell also exposes notebook helper functions: `paired_tcr_subset`, `infer_tumor_like_tissues`, `tumor_like_subset`, `resolve_gene_names`, `expression_frame`, `print_clone_expansion_table`, `safe_rank_genes_groups`, and `tissue_stratified_expansion_de`.
+
+Research rules:
+- Favor analyses that connect transcriptional state with clone size, clonotype structure, tissue, or sample.
+- Every step should produce evidence, not just activity.
+- Prefer steps with high information gain: diagnostics, direct contrasts, enrichment tables, or figures that can differentiate two explanations.
+- For clone-level questions, default to the paired subset returned by `paired_tcr_subset(adata_rna)` unless there is a strong reason not to.
+- If the data only support a descriptive conclusion, say so and avoid causal language.
+- If a proposed control is not actually modeled in code, do not say it was controlled.
+- Avoid placeholder metadata cleaning steps unless missingness is directly demonstrated.
+
+scTCR-specific guardrails:
+- Never assume `raw_clonotype_id` is globally unique across samples.
+- If clone-level conclusions are made, keep sample-aware clonotype scope in mind.
+- Prefer sample-aware or tissue-aware summaries over pooled global claims.
+- Treat unadjusted differential expression as provisional until confounders are revisited.
+- If TCR overlap is partial, acknowledge that the claim only applies to the paired subset.
+- Prefer `tissue_stratified_expansion_de` over ad hoc per-tissue differential expression loops.
+- Do not assume tumor samples are labeled literally as `tumor`; inspect the observed tissue levels or use `tumor_like_subset`.
+- For marker-driven questions, prefer canonical gene symbols and use `resolve_gene_names` or `expression_frame` instead of asserting that informal names like `PD1` are missing.
+
+Execution rules:
+- Do not assume scVI, Seurat, Signac, or internet access.
+- Do not write to arbitrary external locations.
+- Use `scanpy` plotting or standard pandas/seaborn/matplotlib plots when appropriate.
+- Avoid overly large differential testing loops. Keep each notebook step focused and cheap enough to run on a laptop.
+- If a column is missing, branch gracefully instead of failing.
+- Print concise textual summaries so replanning can use them.
+- Before using `.cat`, make sure the column has been cast to category or use the provided helper functions instead.

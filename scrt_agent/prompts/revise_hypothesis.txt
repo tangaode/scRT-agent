@@ -1,0 +1,47 @@
+Revise the working hypothesis after user feedback.
+
+Return a structured `HypothesisRevision` with:
+- `revised_hypothesis`
+- `revision_rationale`
+- `preferred_analysis_type`
+- `retained_constraints`
+
+Rules:
+- Treat the user feedback as the highest-priority steering signal.
+- Preserve the scientific intent when possible, but change direction if the feedback clearly asks for it.
+- Make the revised hypothesis testable with the available dataset.
+- Keep important guardrails from the validation summary.
+- Do not turn the revision into a full notebook plan yet. Only return the revised hypothesis package.
+
+Current hypothesis:
+{hypothesis}
+
+User feedback:
+{user_feedback}
+
+RNA summary:
+{rna_summary}
+
+TCR summary:
+{tcr_summary}
+
+Joint summary:
+{joint_summary}
+
+Validation summary:
+{validation_summary}
+
+Research state:
+{research_state}
+
+Literature summary:
+{literature_summary}
+
+Literature-derived hypothesis candidates:
+{literature_candidates_summary}
+
+Research brief:
+{context_summary}
+
+Past analyses:
+{past_analyses}
