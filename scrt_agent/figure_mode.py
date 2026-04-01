@@ -22,6 +22,7 @@ from .notebook_tools import (
     expression_frame,
     paired_tcr_subset,
     resolve_gene_names,
+    safe_rank_genes_groups,
     tissue_stratified_expansion_de,
     tumor_like_subset,
 )
@@ -42,6 +43,39 @@ class FigureResult:
     summary_path: Path
 
 
+def _global_expansion_de(
+    adata,
+    *,
+    label: str,
+    expansion_col: str = "expanded_clone",
+    min_cells_per_group: int = 20,
+    top_n: int = 12,
+) -> pd.DataFrame:
+    working = paired_tcr_subset(adata)
+    if expansion_col not in working.obs.columns:
+        raise KeyError(f"'{expansion_col}' is not present in adata.obs.")
+    working.obs[expansion_col] = working.obs[expansion_col].fillna(False).astype(bool).map(
+        {True: "expanded", False: "non_expanded"}
+    )
+    ranked = safe_rank_genes_groups(
+        working,
+        groupby=expansion_col,
+        groups=["expanded"],
+        reference="non_expanded",
+        min_cells_per_group=min_cells_per_group,
+        key_added=f"{label}_expanded_vs_non_expanded",
+    )
+    frame = sc.get.rank_genes_groups_df(
+        ranked,
+        group="expanded",
+        key=f"{label}_expanded_vs_non_expanded",
+    ).head(top_n)
+    frame.insert(0, "tissue", label)
+    frame.insert(1, "expanded_n", int((working.obs[expansion_col] == "expanded").sum()))
+    frame.insert(2, "non_expanded_n", int((working.obs[expansion_col] == "non_expanded").sum()))
+    return frame
+
+
 def _normalize_barcode(value: object) -> str:
     if value is None:
         return ""
@@ -49,6 +83,32 @@ def _normalize_barcode(value: object) -> str:
     if not text or text.lower() == "nan":
         return ""
     return text.split("-")[0]
+
+
+def _normalize_barcode_exact(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return ""
+    return text
+
+
+def _normalize_sample(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return ""
+    return text
+
+
+def _make_merge_key(barcode: object, sample: object = None, *, use_core: bool = False) -> str:
+    barcode_value = _normalize_barcode(barcode) if use_core else _normalize_barcode_exact(barcode)
+    sample_value = _normalize_sample(sample)
+    if not barcode_value:
+        return ""
+    return f"{sample_value}::{barcode_value}" if sample_value else barcode_value
 
 
 def _coerce_bool(value: object) -> bool:
@@ -135,17 +195,55 @@ def load_joint_adata(rna_h5ad_path: str | Path, tcr_path: str | Path) -> tuple[a
         )
         clonotype_scope = f"prefixed_by_{sample_scope}"
 
-    adata.obs["barcode"] = adata.obs_names.astype(str)
+    if "barcode" in adata.obs.columns:
+        adata.obs["barcode"] = adata.obs["barcode"].astype(str)
+    else:
+        adata.obs["barcode"] = adata.obs_names.astype(str)
+    adata.obs["barcode_exact"] = adata.obs["barcode"].map(_normalize_barcode_exact)
     adata.obs["barcode_core"] = adata.obs["barcode"].map(_normalize_barcode)
+
+    rna_sample_scope = _sample_scope_column(adata.obs)
+    tcr_sample_scope = _sample_scope_column(tcr_df)
+    adata.obs["sample_merge_key"] = adata.obs.apply(
+        lambda row: _make_merge_key(row["barcode"], row[rna_sample_scope] if rna_sample_scope else np.nan, use_core=False),
+        axis=1,
+    )
+    adata.obs["sample_merge_key_core"] = adata.obs.apply(
+        lambda row: _make_merge_key(row["barcode"], row[rna_sample_scope] if rna_sample_scope else np.nan, use_core=True),
+        axis=1,
+    )
+    if tcr_sample_scope:
+        tcr_df["sample_merge_key"] = [
+            _make_merge_key(barcode, sample, use_core=False)
+            for barcode, sample in zip(tcr_df["barcode"], tcr_df[tcr_sample_scope])
+        ]
+        tcr_df["sample_merge_key_core"] = [
+            _make_merge_key(barcode, sample, use_core=True)
+            for barcode, sample in zip(tcr_df["barcode"], tcr_df[tcr_sample_scope])
+        ]
 
     tcr_cell_exact = _aggregate_tcr_by_column(tcr_df, "barcode")
     tcr_cell_core = _aggregate_tcr_by_column(tcr_df, "barcode_core")
-    exact_overlap = int(adata.obs["barcode"].isin(tcr_cell_exact.index).sum())
+    tcr_cell_sample_exact = _aggregate_tcr_by_column(tcr_df, "sample_merge_key") if "sample_merge_key" in tcr_df.columns else pd.DataFrame()
+    tcr_cell_sample_core = _aggregate_tcr_by_column(tcr_df, "sample_merge_key_core") if "sample_merge_key_core" in tcr_df.columns else pd.DataFrame()
+    exact_overlap = int(adata.obs["barcode_exact"].isin(tcr_cell_exact.index).sum())
     core_overlap = int(adata.obs["barcode_core"].isin(tcr_cell_core.index).sum())
-    merge_mode = "exact" if exact_overlap >= core_overlap else "barcode_core"
+    sample_exact_overlap = int(adata.obs["sample_merge_key"].isin(tcr_cell_sample_exact.index).sum()) if not tcr_cell_sample_exact.empty else 0
+    sample_core_overlap = int(adata.obs["sample_merge_key_core"].isin(tcr_cell_sample_core.index).sum()) if not tcr_cell_sample_core.empty else 0
+    overlap_modes = {
+        "sample_exact": sample_exact_overlap,
+        "sample_barcode_core": sample_core_overlap,
+        "exact": exact_overlap,
+        "barcode_core": core_overlap,
+    }
+    merge_mode = max(overlap_modes, key=overlap_modes.get)
 
-    if merge_mode == "exact":
-        adata.obs = adata.obs.join(tcr_cell_exact, on="barcode")
+    if merge_mode == "sample_exact":
+        adata.obs = adata.obs.join(tcr_cell_sample_exact, on="sample_merge_key")
+    elif merge_mode == "sample_barcode_core":
+        adata.obs = adata.obs.join(tcr_cell_sample_core, on="sample_merge_key_core")
+    elif merge_mode == "exact":
+        adata.obs = adata.obs.join(tcr_cell_exact, on="barcode_exact")
     else:
         adata.obs = adata.obs.join(tcr_cell_core, on="barcode_core")
 
@@ -164,10 +262,12 @@ def load_joint_adata(rna_h5ad_path: str | Path, tcr_path: str | Path) -> tuple[a
     meta = {
         "exact_overlap": exact_overlap,
         "core_overlap": core_overlap,
+        "sample_exact_overlap": sample_exact_overlap,
+        "sample_core_overlap": sample_core_overlap,
         "merge_mode": merge_mode,
         "clonotype_scope": clonotype_scope,
         "paired_cells": int(adata.obs["has_tcr"].sum()),
-        "expanded_fraction": float(adata.obs.loc[adata.obs["has_tcr"], "expanded_clone"].mean()),
+        "expanded_fraction": float(adata.obs.loc[adata.obs["has_tcr"], "expanded_clone"].mean()) if int(adata.obs["has_tcr"].sum()) else 0.0,
     }
     return adata, meta
 
@@ -261,7 +361,23 @@ def build_publication_figure(
     marker_panel_gene = resolved.get("CCL5", next(iter(resolved.values()), None))
     hypothesis_gene = resolved.get("XBP1", marker_panel_gene)
 
-    de_table = tissue_stratified_expansion_de(tumor_like, top_n=6)
+    figure_notes: list[str] = []
+    de_source = "tumor_like_stratified"
+    de_title = "Top expanded-vs-non-expanded DE genes\nin tumor-like tissues"
+    try:
+        de_table = tissue_stratified_expansion_de(tumor_like, top_n=6)
+    except Exception as exc:
+        figure_notes.append(f"Stratified tumor-like DE fallback triggered: {exc}")
+        try:
+            de_table = _global_expansion_de(tumor_like, label="tumor_like_global", top_n=12)
+            de_source = "tumor_like_global"
+            de_title = "Top expanded-vs-non-expanded DE genes\nin pooled tumor-like cells"
+        except Exception as inner_exc:
+            figure_notes.append(f"Pooled tumor-like DE fallback triggered: {inner_exc}")
+            de_table = _global_expansion_de(adata, label="all_paired_global", top_n=12)
+            de_source = "all_paired_global"
+            de_title = "Top expanded-vs-non-expanded DE genes\nin all paired cells"
+
     heatmap_table = (
         de_table.pivot_table(
             index="names",
@@ -360,7 +476,7 @@ def build_publication_figure(
         cbar_kws={"label": "log fold change"},
         ax=ax_e,
     )
-    ax_e.set_title("Top expanded-vs-non-expanded DE genes\nin tumor-like tissues")
+    ax_e.set_title(de_title)
     ax_e.set_xlabel("")
     ax_e.set_ylabel("")
     _panel_label(ax_e, "e")
@@ -389,6 +505,8 @@ def build_publication_figure(
         f"Expanded fraction among paired cells: {meta['expanded_fraction']:.3f}",
         f"Tumor-like tissues: {', '.join(sorted(tumor_like.obs['tissue'].astype(str).unique()))}",
         f"Resolved markers: {', '.join(f'{src}->{dst}' for src, dst in resolved.items()) or 'none'}",
+        f"DE source for panel e: {de_source}",
+        f"Figure notes: {' | '.join(figure_notes) if figure_notes else 'none'}",
         "",
         "Top DE genes by tissue:",
         de_table[["tissue", "names", "logfoldchanges", "pvals_adj"]].to_string(index=False),

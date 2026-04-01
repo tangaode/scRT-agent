@@ -60,6 +60,94 @@ RNA_METADATA_HINTS = (
     "cluster",
     "leiden",
 )
+
+
+def _parse_status_text(status_text: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for line in status_text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        parsed[key.strip().lower()] = value.strip()
+    return parsed
+
+
+def _publication_figure_section_from_status(status_path: Path) -> list[str]:
+    if not status_path.exists():
+        return []
+    parsed = _parse_status_text(status_path.read_text(encoding="utf-8"))
+    status = parsed.get("status", "unknown")
+    lines = ["", "Publication figure", f"Status: {status}"]
+    if status == "success":
+        if parsed.get("png"):
+            lines.append(f"PNG: {parsed['png']}")
+        if parsed.get("pdf"):
+            lines.append(f"PDF: {parsed['pdf']}")
+        if parsed.get("summary"):
+            lines.append(f"Summary: {parsed['summary']}")
+    else:
+        lines.append(f"Reason: {parsed.get('reason', 'unknown error')}")
+    if parsed.get("note"):
+        lines.append(f"Note: {parsed['note']}")
+    return lines
+
+
+def refresh_run_summary_from_artifacts(run_dir: str | Path) -> Path | None:
+    run_dir = Path(run_dir)
+    summary_path = run_dir / "run_summary.txt"
+    figure_status_path = run_dir / "figure_status.txt"
+    if not summary_path.exists() or not figure_status_path.exists():
+        return None
+
+    lines = summary_path.read_text(encoding="utf-8").splitlines()
+    refreshed: list[str] = []
+    in_publication_section = False
+    for line in lines:
+        if line == "Publication figure":
+            in_publication_section = True
+            continue
+        if in_publication_section:
+            continue
+        refreshed.append(line)
+
+    first_blank_idx = next((idx for idx, line in enumerate(refreshed) if line == ""), len(refreshed))
+    figure_status_line = f"Figure status file: {figure_status_path}"
+    figure_status_idx = next((idx for idx, line in enumerate(refreshed[:first_blank_idx]) if line.startswith("Figure status file:")), None)
+    if figure_status_idx is not None:
+        refreshed[figure_status_idx] = figure_status_line
+    else:
+        refreshed.insert(first_blank_idx, figure_status_line)
+
+    refreshed.extend(_publication_figure_section_from_status(figure_status_path))
+    summary_path.write_text("\n".join(refreshed).rstrip() + "\n", encoding="utf-8")
+    return summary_path
+
+
+def write_figure_status_file(
+    run_dir: str | Path,
+    *,
+    figure_result: FigureResult | None = None,
+    figure_error: str | None = None,
+    note: str | None = None,
+) -> Path:
+    run_dir = Path(run_dir)
+    status_path = run_dir / "figure_status.txt"
+    if figure_result is not None:
+        lines = [
+            "status: success",
+            f"png: {figure_result.png_path}",
+            f"pdf: {figure_result.pdf_path}",
+            f"summary: {figure_result.summary_path}",
+        ]
+    else:
+        lines = [
+            "status: failed",
+            f"reason: {figure_error or 'unknown error'}",
+        ]
+    if note:
+        lines.append(f"note: {note}")
+    status_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return status_path
 def _top_counts(series, limit: int = 8) -> str:
     counts = series.value_counts(dropna=True).head(limit)
     if counts.empty:
@@ -636,21 +724,11 @@ class ScRTAgent:
 
         figure_status_path: Path | None = None
         if self.generate_publication_figure:
-            figure_status_path = self.output_dir / "figure_status.txt"
-            if figure_result is not None:
-                figure_status_path.write_text(
-                    "status: success\n"
-                    f"png: {figure_result.png_path}\n"
-                    f"pdf: {figure_result.pdf_path}\n"
-                    f"summary: {figure_result.summary_path}\n",
-                    encoding="utf-8",
-                )
-            else:
-                figure_status_path.write_text(
-                    "status: failed\n"
-                    f"reason: {figure_error or 'unknown error'}\n",
-                    encoding="utf-8",
-                )
+            figure_status_path = write_figure_status_file(
+                self.output_dir,
+                figure_result=figure_result,
+                figure_error=figure_error,
+            )
 
         summary_path = self.output_dir / "run_summary.txt"
         summary_lines = [
@@ -705,25 +783,8 @@ class ScRTAgent:
             "\n".join(str(path) for path in notebook_paths) or "None",
             ]
         )
-        if figure_result is not None:
-            summary_lines.extend(
-                [
-                    "",
-                    "Publication figure",
-                    f"PNG: {figure_result.png_path}",
-                    f"PDF: {figure_result.pdf_path}",
-                    f"Summary: {figure_result.summary_path}",
-                ]
-            )
-        elif self.generate_publication_figure:
-            summary_lines.extend(
-                [
-                    "",
-                    "Publication figure",
-                    "Status: failed",
-                    f"Reason: {figure_error or 'unknown error'}",
-                ]
-            )
         summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
+        if figure_status_path is not None:
+            refresh_run_summary_from_artifacts(self.output_dir)
         self.logger.info(f"Run complete. Summary written to {summary_path}")
         return summary_path

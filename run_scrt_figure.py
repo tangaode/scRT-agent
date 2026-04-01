@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
+from scrt_agent.agent import refresh_run_summary_from_artifacts, write_figure_status_file
 from scrt_agent.figure_mode import build_publication_figure
 
 
@@ -23,6 +25,15 @@ def main() -> int:
         output_dir=args.output_dir,
         figure_name=args.figure_name,
     )
+    output_dir = Path(args.output_dir).resolve()
+    run_dir = output_dir.parent if output_dir.name.lower() == "figure" else output_dir
+    if (run_dir / "run_summary.txt").exists():
+        write_figure_status_file(
+            run_dir,
+            figure_result=result,
+            note="Figure generated with run_scrt_figure.py",
+        )
+        refresh_run_summary_from_artifacts(run_dir)
     print(f"PNG: {result.png_path}")
     print(f"PDF: {result.pdf_path}")
     print(f"Summary: {result.summary_path}")

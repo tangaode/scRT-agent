@@ -362,6 +362,13 @@ adata_rna.obs["expanded_clone"] = adata_rna.obs["clone_size"] >= 3
 adata_rna.obs["singleton_clone"] = adata_rna.obs["clone_size"] == 1
 adata_rna.obs["small_clone"] = adata_rna.obs["clone_size"].between(2, 4)
 ensure_obs_columns(adata_rna, ["sample_id", "tissue", "sample_key"], fill_value="Unknown", as_category=True)
+if "cell_type" not in adata_rna.obs.columns:
+    for alias in ("cluster_cell_type", "celltype", "celltypes", "annotation", "annotated_cell_type"):
+        if alias in adata_rna.obs.columns:
+            adata_rna.obs["cell_type"] = adata_rna.obs[alias].astype(str)
+            print(f"Created cell_type alias from {{alias}}")
+            break
+ensure_obs_column(adata_rna, "cell_type", fill_value="Unknown", as_category=True)
 
 print(f"RNA shape: {{adata_rna.n_obs}} x {{adata_rna.n_vars}}")
 print(f"TCR rows: {{len(tcr_df)}}")
