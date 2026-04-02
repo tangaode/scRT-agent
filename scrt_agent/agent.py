@@ -292,11 +292,12 @@ class ScRTAgent:
             use_documentation=self.use_documentation,
         )
 
-    def prepare_candidate_hypotheses(self) -> CandidateHypothesisMenu:
+    def prepare_candidate_hypotheses(self, user_feedback: str = "") -> CandidateHypothesisMenu:
         research_ledger = self._make_research_ledger()
         menu = self.hypothesis_generator.generate_candidate_hypotheses(
             research_state_summary=research_ledger.to_prompt_text(),
             past_analyses="",
+            user_feedback=user_feedback,
         )
         return menu
 

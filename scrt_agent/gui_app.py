@@ -167,9 +167,9 @@ class ScRTDesktopApp(tk.Tk):
         frame.columnconfigure(1, weight=1)
 
         buttons = [
-            ("Generate Hypotheses", self.generate_hypotheses, 0, 0),
+            ("Generate / Regenerate Hypotheses", self.generate_hypotheses, 0, 0),
             ("Load Session", self.load_session, 0, 1),
-            ("Approve Selected Hypothesis", self.approve_selected_hypothesis, 1, 0),
+            ("Revise And Approve Selected Hypothesis", self.approve_selected_hypothesis, 1, 0),
             ("Run Approved Analysis", self.run_analysis, 1, 1),
             ("Open Final Hypothesis", self.open_final_hypothesis, 2, 0),
             ("Open Figure Status", self.open_figure_status, 2, 1),
@@ -206,9 +206,13 @@ class ScRTDesktopApp(tk.Tk):
         self.candidate_detail = tk.Text(frame, wrap="word", width=70, height=18)
         self.candidate_detail.grid(row=1, column=1, sticky="nsew")
 
-        ttk.Label(frame, text="Feedback for revision").grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(frame, text="Feedback for generation or revision").grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(
+            frame,
+            text="This text is sent to the model when you generate candidates and when you revise the selected hypothesis.",
+        ).grid(row=3, column=0, columnspan=2, sticky="w")
         self.feedback_text = tk.Text(frame, wrap="word", height=8)
-        self.feedback_text.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        self.feedback_text.grid(row=4, column=0, columnspan=2, sticky="nsew")
 
     def _build_log_panel(self, parent) -> None:
         frame = ttk.LabelFrame(parent, text="Run Log", padding=10)
@@ -322,13 +326,16 @@ class ScRTDesktopApp(tk.Tk):
 
     def generate_hypotheses(self) -> None:
         session_dir = self._session_dir()
+        feedback_text = self.feedback_text.get("1.0", "end").strip()
 
         def task():
             session_dir.mkdir(parents=True, exist_ok=True)
             agent = self._build_agent(analysis_name=session_dir.name, output_home=str(session_dir.parent))
-            menu = agent.prepare_candidate_hypotheses()
+            menu = agent.prepare_candidate_hypotheses(user_feedback=feedback_text)
             write_json(session_dir / "candidate_hypotheses.json", menu.model_dump())
             (session_dir / "candidate_hypotheses.md").write_text(format_candidate_menu_markdown(menu), encoding="utf-8")
+            if feedback_text:
+                (session_dir / "candidate_generation_feedback.txt").write_text(feedback_text + "\n", encoding="utf-8")
             config = {
                 "rna_h5ad_path": self.rna_h5ad_var.get().strip(),
                 "tcr_path": self.tcr_path_var.get().strip(),
@@ -337,11 +344,14 @@ class ScRTDesktopApp(tk.Tk):
                 "model_name": self.model_name_var.get().strip() or "gpt-4o",
                 "with_figure": self.with_figure_var.get(),
                 "log_prompts": self.log_prompts_var.get(),
+                "candidate_generation_feedback": feedback_text,
             }
             write_json(session_dir / "session_config.json", config)
             self.current_session_dir = session_dir
             self.current_candidates = [item.model_dump() for item in menu.candidates]
             self.message_queue.put(("done", lambda: self._show_candidates(menu.model_dump())))
+            if feedback_text:
+                self._queue_log(f"Candidate generation feedback applied: {feedback_text}\n")
 
         self._run_background("Generate hypotheses", task)
 

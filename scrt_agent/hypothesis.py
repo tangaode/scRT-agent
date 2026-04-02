@@ -138,6 +138,7 @@ class HypothesisGenerator:
         self,
         research_state_summary: str,
         past_analyses: str = "",
+        user_feedback: str = "",
     ) -> CandidateHypothesisMenu:
         prompt = self._read_prompt("candidate_hypotheses.txt").format(
             rna_summary=self.rna_summary,
@@ -149,6 +150,7 @@ class HypothesisGenerator:
             literature_candidates_summary=self.literature_candidates_summary,
             context_summary=self.context_summary,
             past_analyses=past_analyses or "No previous analyses.",
+            user_feedback=user_feedback.strip() or "No extra user feedback.",
         )
         if self.log_prompts:
             self.logger.log_prompt("user", prompt, "candidate_hypotheses")
