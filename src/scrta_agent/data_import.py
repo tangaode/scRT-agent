@@ -310,6 +310,9 @@ def convert_rna_sources_to_h5ad(sources: list[Path], destination: Path) -> tuple
         notes.extend(source_notes)
     combined = ad.concat(adatas, join="outer", merge="same", index_unique=None)
     combined.uns["scrta_input_sources"] = [str(path) for path in sources]
+    if combined.obs_names.has_duplicates:
+        combined.obs_names_make_unique()
+        notes.append("Duplicate RNA cell names were made unique after sample concatenation.")
     if combined.var_names.has_duplicates:
         combined.var_names_make_unique()
         notes.append("Duplicate RNA feature names were made unique.")
@@ -459,7 +462,10 @@ def _read_rna_source_to_adata(source: Path):
         raise RuntimeError('Install analysis dependencies first: pip install -e ".[analysis]"') from exc
 
     suffix = source.suffix.lower()
-    if source.suffix.lower() == ".h5ad":
+    if _is_loose_10x_matrix_file(source):
+        adata = _read_loose_10x_triplet(source)
+        notes.append(f"RNA source {source.name} was read as a prefixed 10x matrix triplet.")
+    elif source.suffix.lower() == ".h5ad":
         adata = ad.read_h5ad(source)
         notes.append(f"RNA source {source.name} was read as h5ad.")
     elif source.is_dir():
@@ -600,6 +606,7 @@ def _expand_rna_candidates(paths: list[Path]) -> list[Path]:
         if not path.exists():
             continue
         if path.is_dir():
+            candidates.extend(_find_loose_10x_matrix_files(path))
             for nested in [
                 "filtered_feature_bc_matrix",
                 "raw_feature_bc_matrix",
@@ -623,6 +630,8 @@ def _expand_rna_candidates(paths: list[Path]) -> list[Path]:
             )
         elif _is_10x_member_file(path) and _looks_like_10x_matrix_dir(path.parent):
             candidates.append(path.parent)
+        elif _is_loose_10x_matrix_file(path):
+            candidates.append(path)
         elif not _looks_like_tcr_file(path) and _looks_like_rna_file(path):
             candidates.append(path)
     return _dedupe_paths(candidates)
@@ -661,6 +670,10 @@ def _looks_like_rna_file(path: Path) -> bool:
         return False
     if _is_10x_member_file(path):
         return False
+    if _is_loose_10x_sidecar_file(path):
+        return False
+    if _is_loose_10x_matrix_file(path):
+        return True
     if any(token in str(path).lower() for token in ("vdj", "tcr", "contig", "clonotype", "airr")):
         return False
     if name.endswith((".csv.gz", ".tsv.gz", ".txt.gz")):
@@ -682,17 +695,90 @@ def _is_10x_member_file(path: Path) -> bool:
     }
 
 
+def _is_loose_10x_matrix_file(path: Path) -> bool:
+    return path.is_file() and path.name.lower().endswith((".matrix.mtx", ".matrix.mtx.gz"))
+
+
+def _is_loose_10x_sidecar_file(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith(
+        (
+            ".barcodes.tsv",
+            ".barcodes.tsv.gz",
+            "_barcodes.tsv",
+            "_barcodes.tsv.gz",
+            ".features.tsv",
+            ".features.tsv.gz",
+            "_features.tsv",
+            "_features.tsv.gz",
+            ".genes.tsv",
+            ".genes.tsv.gz",
+            "_genes.tsv",
+            "_genes.tsv.gz",
+        )
+    )
+
+
+def _loose_10x_prefix(matrix_path: Path) -> str:
+    name = matrix_path.name
+    for suffix in [".matrix.mtx.gz", ".matrix.mtx"]:
+        if name.lower().endswith(suffix):
+            return name[: -len(suffix)]
+    return matrix_path.stem
+
+
+def _find_loose_10x_matrix_files(root: Path) -> list[Path]:
+    matrices: list[Path] = []
+    for matrix in sorted(root.rglob("*")):
+        if not _is_loose_10x_matrix_file(matrix):
+            continue
+        prefix = _loose_10x_prefix(matrix)
+        if _loose_10x_pair_paths(matrix.parent, prefix):
+            matrices.append(matrix)
+    return matrices
+
+
+def _loose_10x_pair_paths(directory: Path, prefix: str) -> tuple[Path, Path] | None:
+    barcode = _first_existing(
+        directory / f"{prefix}.barcodes.tsv.gz",
+        directory / f"{prefix}.barcodes.tsv",
+        directory / f"{prefix}_barcodes.tsv.gz",
+        directory / f"{prefix}_barcodes.tsv",
+    )
+    feature = _first_existing(
+        directory / f"{prefix}.features.tsv.gz",
+        directory / f"{prefix}.features.tsv",
+        directory / f"{prefix}.genes.tsv.gz",
+        directory / f"{prefix}.genes.tsv",
+        directory / f"{prefix}_features.tsv.gz",
+        directory / f"{prefix}_features.tsv",
+        directory / f"{prefix}_genes.tsv.gz",
+        directory / f"{prefix}_genes.tsv",
+    )
+    if barcode and feature:
+        return barcode, feature
+    return None
+
+
+def _first_existing(*paths: Path) -> Path | None:
+    for path in paths:
+        if path.exists():
+            return path
+    return None
+
+
 def _looks_like_tcr_file(path: Path) -> bool:
     name = path.name.lower()
     if _is_supported_archive(path):
         return False
     if name in TCR_FILE_NAMES:
         return True
-    if name.endswith((".csv.gz", ".tsv.gz", ".txt.gz")):
-        return True
     if path.suffix.lower() not in TCR_FILE_SUFFIXES:
+        if not name.endswith((".csv.gz", ".tsv.gz", ".txt.gz")):
+            return False
+    lowered = name
+    if "bcr" in lowered and "tcr" not in lowered:
         return False
-    lowered = str(path).lower()
     return any(token in lowered for token in ("tcr", "vdj", "contig", "clonotype", "airr"))
 
 
@@ -720,6 +806,60 @@ def _read_10x_directory(path: Path):
     if not _looks_like_10x_matrix_dir(path):
         raise ValueError(f"Directory does not look like a 10x matrix folder: {path}")
     return sc.read_10x_mtx(str(path), var_names="gene_symbols", make_unique=True)
+
+
+def _read_loose_10x_triplet(matrix_path: Path):
+    try:
+        import anndata as ad
+        from scipy import io as scipy_io
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError('Prefixed 10x matrix input requires scipy and anndata: pip install -e ".[analysis]"') from exc
+
+    prefix = _loose_10x_prefix(matrix_path)
+    pair = _loose_10x_pair_paths(matrix_path.parent, prefix)
+    if not pair:
+        raise ValueError(f"Could not find matching barcodes/features files for {matrix_path}")
+    barcode_path, feature_path = pair
+    with _open_text_file(barcode_path) as handle:
+        barcodes = [line.strip() for line in handle if line.strip()]
+    var_names: list[str] = []
+    feature_ids: list[str] = []
+    feature_types: list[str] = []
+    with _open_text_file(feature_path) as handle:
+        for line in handle:
+            parts = line.rstrip("\n").split("\t")
+            if not parts or not parts[0]:
+                continue
+            feature_ids.append(parts[0])
+            var_names.append(parts[1] if len(parts) > 1 and parts[1] else parts[0])
+            feature_types.append(parts[2] if len(parts) > 2 else "")
+    with _open_binary_file(matrix_path) as handle:
+        matrix = scipy_io.mmread(handle).tocsr()
+    adata = ad.AnnData(matrix.T)
+    adata.obs_names = barcodes
+    adata.var_names = var_names
+    adata.var["feature_id"] = feature_ids
+    if any(feature_types):
+        adata.var["feature_type"] = feature_types
+    adata.obs_names_make_unique()
+    adata.var_names_make_unique()
+    return adata
+
+
+def _open_text_file(path: Path):
+    if path.name.lower().endswith(".gz"):
+        import gzip
+
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return path.open("r", encoding="utf-8", errors="replace")
+
+
+def _open_binary_file(path: Path):
+    if path.name.lower().endswith(".gz"):
+        import gzip
+
+        return gzip.open(path, "rb")
+    return path.open("rb")
 
 
 def _resolve_tcr_table(source: Path) -> Path:
@@ -826,6 +966,8 @@ def _path_from_plan(value: Any, allowed_roots: list[Path]) -> Path | None:
 
 
 def _format_label(path: Path) -> str:
+    if _is_loose_10x_matrix_file(path):
+        return "prefixed_10x_mtx_triplet"
     if path.is_dir():
         return "10x_mtx_directory"
     name = path.name.lower()
@@ -852,6 +994,8 @@ def _infer_sample_id(path: Path) -> str:
         "raw_feature_bc_matrix_mex",
     } and path.parent.name:
         name = path.parent.name
+    if _is_loose_10x_matrix_file(path):
+        name = _loose_10x_prefix(path)
     generic_file_names = {
         "rna",
         "expression",

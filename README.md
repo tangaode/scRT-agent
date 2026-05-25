@@ -70,6 +70,9 @@ inputs:
 - Sample archives such as ZIP, TAR, TAR.GZ and TGZ files.
 - RNA `.h5ad` files.
 - 10x `filtered_feature_bc_matrix` or `raw_feature_bc_matrix` directories.
+- GEO-style prefixed 10x triplets such as
+  `SAMPLE.matrix.mtx.gz`, `SAMPLE.barcodes.tsv.gz` and
+  `SAMPLE.features.tsv.gz`.
 - 10x HDF5 gene-expression matrices.
 - Dense text expression matrices in CSV, TSV or TXT format.
 - Loom or AnnData zarr stores when the required Python readers are installed.

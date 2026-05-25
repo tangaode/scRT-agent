@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+import gzip
 import zipfile
 
 import pytest
 
 from scrta_agent.agents import ScRTATeam
-from scrta_agent.data_import import choose_tcr_sources, clone_size_category, materialize_input_paths, split_user_paths
+from scrta_agent.data_import import (
+    choose_tcr_sources,
+    clone_size_category,
+    materialize_input_paths,
+    prepare_inputs,
+    split_user_paths,
+)
 from scrta_agent.deep_dive import DeepDiveSelection
 from scrta_agent.llm import LLMClient
 import scrta_agent.llm as llm_module
@@ -272,3 +279,43 @@ def test_llm_client_loads_root_env_file(tmp_path: Path, monkeypatch: pytest.Monk
 
     assert client.api_key == "dummy_key"
     assert client.base_url == "https://example.invalid/v1"
+
+
+def test_prepare_inputs_handles_prefixed_geo_10x_triplets_and_tcr_gz(tmp_path: Path) -> None:
+    pytest.importorskip("anndata")
+    pytest.importorskip("scipy")
+    pd = pytest.importorskip("pandas")
+
+    raw = tmp_path / "GSE_RAW"
+    raw.mkdir()
+    _write_gzip_text(
+        raw / "GSM1_sampleA.matrix.mtx.gz",
+        "%%MatrixMarket matrix coordinate integer general\n%\n2 2 2\n1 1 3\n2 2 4\n",
+    )
+    _write_gzip_text(raw / "GSM1_sampleA.barcodes.tsv.gz", "AAAC-1\nTTTG-1\n")
+    _write_gzip_text(raw / "GSM1_sampleA.features.tsv.gz", "ENSG1\tGZMB\tGene Expression\nENSG2\tTCF7\tGene Expression\n")
+    _write_gzip_text(
+        raw / "GSM2_sampleA-TCR_filtered_contig_annotations.csv.gz",
+        "barcode,raw_clonotype_id,cdr3\nAAAC-1,clonotype1,CASSA\nTTTG-1,clonotype2,CASSB\n",
+    )
+    _write_gzip_text(
+        raw / "GSM3_sampleA-BCR_filtered_contig_annotations.csv.gz",
+        "barcode,raw_clonotype_id,cdr3\nAAAC-1,bcr1,CARDR\n",
+    )
+
+    result = prepare_inputs(
+        rna_inputs=str(raw),
+        tcr_inputs=str(raw),
+        output_dir=tmp_path / "prepared",
+        require_llm_plan=False,
+    )
+
+    tcr = pd.read_csv(result.tcr_path)
+    assert Path(result.rna_h5ad_path).exists()
+    assert set(tcr["clonotype_id"]) == {"clonotype1", "clonotype2"}
+    assert tcr["sample_id"].str.contains("TCR").all()
+
+
+def _write_gzip_text(path: Path, text: str) -> None:
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        handle.write(text)
