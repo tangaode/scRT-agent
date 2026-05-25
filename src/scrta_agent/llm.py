@@ -32,7 +32,7 @@ def _load_local_env_files() -> None:
 
 
 def _parse_env_line(line: str) -> tuple[str, str] | None:
-    text = line.strip()
+    text = line.lstrip("\ufeff").strip()
     if not text or text.startswith("#"):
         return None
     if text.startswith("export "):

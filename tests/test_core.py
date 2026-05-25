@@ -260,7 +260,7 @@ def test_project_folder_archive_materialization_discovers_tcr_tables(tmp_path: P
 def test_llm_client_loads_root_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     env_file = tmp_path / ".scrta_agent.env"
     env_file.write_text(
-        "SCRTA_AGENT_API_KEY=dummy_key\nSCRTA_AGENT_API_BASE=https://example.invalid/v1\n",
+        "\ufeffSCRTA_AGENT_API_KEY=dummy_key\nSCRTA_AGENT_API_BASE=https://example.invalid/v1\n",
         encoding="utf-8",
     )
     monkeypatch.delenv("SCRTA_AGENT_API_KEY", raising=False)
