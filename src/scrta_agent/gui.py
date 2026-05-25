@@ -103,14 +103,20 @@ class ScRTAgentLauncher(tk.Tk):
         ).grid(row=row, column=1, sticky="ew", pady=4)
         row += 1
 
-        ttk.Label(config, text="RNA input(s)").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Label(config, text="RNA folder(s) or files").grid(row=row, column=0, sticky="w", pady=4)
         ttk.Entry(config, textvariable=self.rna_var, width=64).grid(row=row, column=1, sticky="ew", pady=4)
-        ttk.Button(config, text="Browse", command=lambda: self._browse_input(self.rna_var)).grid(row=row, column=2, padx=6)
+        rna_buttons = ttk.Frame(config)
+        rna_buttons.grid(row=row, column=2, padx=6)
+        ttk.Button(rna_buttons, text="Browse Folder", command=lambda: self._browse_folder(self.rna_var)).grid(row=0, column=0, padx=(0, 4))
+        ttk.Button(rna_buttons, text="Add Files", command=lambda: self._add_input_files(self.rna_var)).grid(row=0, column=1)
         row += 1
 
-        ttk.Label(config, text="TCR input(s)").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Label(config, text="TCR folder(s) or files").grid(row=row, column=0, sticky="w", pady=4)
         ttk.Entry(config, textvariable=self.tcr_var, width=64).grid(row=row, column=1, sticky="ew", pady=4)
-        ttk.Button(config, text="Browse", command=lambda: self._browse_input(self.tcr_var)).grid(row=row, column=2, padx=6)
+        tcr_buttons = ttk.Frame(config)
+        tcr_buttons.grid(row=row, column=2, padx=6)
+        ttk.Button(tcr_buttons, text="Browse Folder", command=lambda: self._browse_folder(self.tcr_var)).grid(row=0, column=0, padx=(0, 4))
+        ttk.Button(tcr_buttons, text="Add Files", command=lambda: self._add_input_files(self.tcr_var)).grid(row=0, column=1)
         row += 1
 
         ttk.Label(config, text="Research brief").grid(row=row, column=0, sticky="w", pady=4)
@@ -281,6 +287,30 @@ class ScRTAgentLauncher(tk.Tk):
         directory = filedialog.askdirectory(title="Select input directory")
         if directory:
             target_var.set(directory)
+
+    def _browse_folder(self, target_var: tk.StringVar) -> None:
+        directory = filedialog.askdirectory(title="Select project or sample folder")
+        if directory:
+            self._append_paths_to_var(target_var, [directory])
+
+    def _add_input_files(self, target_var: tk.StringVar) -> None:
+        paths = filedialog.askopenfilenames(
+            title="Select input files or archives",
+            filetypes=[
+                ("Supported files", "*.h5ad *.h5 *.hdf5 *.csv *.tsv *.txt *.loom *.zarr *.zip *.tar *.gz *.tgz *.bz2 *.xz"),
+                ("All files", "*.*"),
+            ],
+        )
+        if paths:
+            self._append_paths_to_var(target_var, list(paths))
+
+    @staticmethod
+    def _append_paths_to_var(target_var: tk.StringVar, paths: list[str]) -> None:
+        existing = [part.strip() for part in target_var.get().split(";") if part.strip()]
+        for path in paths:
+            if path and path not in existing:
+                existing.append(path)
+        target_var.set(";".join(existing))
 
     def _browse_brief_file(self) -> None:
         path = filedialog.askopenfilename(title="Select research brief file")

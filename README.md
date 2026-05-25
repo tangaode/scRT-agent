@@ -20,6 +20,8 @@ orthogonal evidence.
 - LLM-assisted input preparation for common scRNA-seq and scTCR-seq file
   layouts, producing a workflow-ready RNA `.h5ad` file and normalized TCR
   table.
+- Project-folder and multi-sample archive input support for common sequencing
+  delivery layouts.
 - User-controlled hypothesis selection and editing before the deep-dive stage.
 - Dataset profiling for `.h5ad` scRNA-seq objects and tabular scTCR files.
 - Standard paired scRNA/scTCR analysis script generation.
@@ -64,6 +66,8 @@ profile available metadata and infer join keys before analysis.
 The interactive preparation layer can also start from common raw or processed
 inputs:
 
+- Project folders containing multiple sample folders or sample archives.
+- Sample archives such as ZIP, TAR, TAR.GZ and TGZ files.
 - RNA `.h5ad` files.
 - 10x `filtered_feature_bc_matrix` or `raw_feature_bc_matrix` directories.
 - 10x HDF5 gene-expression matrices.
@@ -74,7 +78,9 @@ inputs:
 
 Large matrices are never sent to the LLM. The LLM reviews a file inventory and
 proposes a preparation plan; conversion is performed locally with standard
-Python readers.
+Python readers. When multiple compatible samples are found, scRT-agent combines
+them into one `.h5ad` file and one normalized TCR table while preserving
+`sample_id`, `input_sample_id` and `input_source_path` metadata.
 
 ## LLM Configuration
 
@@ -120,8 +126,8 @@ To prepare inputs without launching the full workflow:
 
 ```bash
 scrta-agent prepare \
-  --rna-input /path/to/filtered_feature_bc_matrix \
-  --tcr-input /path/to/filtered_contig_annotations.csv \
+  --rna-input /path/to/rna_project_folder \
+  --tcr-input /path/to/tcr_project_folder \
   --out ./prepared_inputs/example \
   --analysis-name example_scrna_sctcr
 ```

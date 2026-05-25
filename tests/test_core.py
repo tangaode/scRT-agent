@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import zipfile
 
 import pytest
 
 from scrta_agent.agents import ScRTATeam
-from scrta_agent.data_import import clone_size_category, split_user_paths
+from scrta_agent.data_import import choose_tcr_sources, clone_size_category, materialize_input_paths, split_user_paths
 from scrta_agent.deep_dive import DeepDiveSelection
 from scrta_agent.llm import LLMClient
 from scrta_agent.rag import RagChunk, retrieve_rag_chunks
@@ -235,3 +236,21 @@ def test_interactive_path_split_and_clone_bins() -> None:
     assert clone_size_category(20) == "Medium"
     assert clone_size_category(100) == "Large"
     assert clone_size_category(500) == "Hyperexpanded"
+
+
+def test_project_folder_archive_materialization_discovers_tcr_tables(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    archive = project / "sample_a.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr(
+            "sample_a/filtered_contig_annotations.csv",
+            "barcode,raw_clonotype_id,cdr3\nAAAC-1,clonotype1,CASSA\n",
+        )
+
+    materialized, notes = materialize_input_paths([project], tmp_path / "extracted")
+    sources = choose_tcr_sources(materialized, {})
+
+    assert notes
+    assert len(sources) == 1
+    assert sources[0].name == "filtered_contig_annotations.csv"

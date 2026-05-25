@@ -59,8 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
     agents.add_argument("--json", action="store_true", help="print JSON")
 
     prepare = subparsers.add_parser("prepare", help="prepare user input files for the workflow")
-    prepare.add_argument("--rna-input", nargs="+", required=True, help="RNA input path(s)")
-    prepare.add_argument("--tcr-input", nargs="+", required=True, help="TCR input path(s)")
+    prepare.add_argument("--rna-input", nargs="+", required=True, help="RNA project folder(s), sample archive(s), or file(s)")
+    prepare.add_argument("--tcr-input", nargs="+", required=True, help="TCR project folder(s), sample archive(s), or file(s)")
     prepare.add_argument("--out", required=True, help="prepared input output directory")
     prepare.add_argument("--analysis-name", default="scrna_sctcr_case", help="analysis name")
     prepare.add_argument("--model", default=None, help="LLM model name")

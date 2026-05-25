@@ -4,6 +4,8 @@ import csv
 import json
 import re
 import shutil
+import tarfile
+import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,7 +21,6 @@ RNA_FILE_SUFFIXES = {
     ".csv",
     ".tsv",
     ".txt",
-    ".mtx",
     ".loom",
     ".zarr",
 }
@@ -31,6 +32,16 @@ TCR_FILE_NAMES = {
     "airr_rearrangement.tsv",
 }
 TCR_FILE_SUFFIXES = {".csv", ".tsv", ".txt"}
+ARCHIVE_SUFFIXES = (
+    ".zip",
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tbz2",
+    ".tar.xz",
+    ".txz",
+)
 
 
 @dataclass
@@ -95,7 +106,16 @@ def prepare_inputs(
     if not tcr_paths:
         raise ValueError("At least one TCR input path is required.")
 
-    all_summaries = summarize_inputs(rna_paths, "rna") + summarize_inputs(tcr_paths, "tcr")
+    materialized_rna_paths, rna_archive_notes = materialize_input_paths(
+        rna_paths,
+        out / "extracted_inputs" / "rna",
+    )
+    materialized_tcr_paths, tcr_archive_notes = materialize_input_paths(
+        tcr_paths,
+        out / "extracted_inputs" / "tcr",
+    )
+
+    all_summaries = summarize_inputs(materialized_rna_paths, "rna") + summarize_inputs(materialized_tcr_paths, "tcr")
     plan_text, plan_json = build_llm_preparation_plan(
         all_summaries,
         llm=llm,
@@ -105,21 +125,23 @@ def prepare_inputs(
     plan_path = write_text(out / "data_preparation_plan.md", plan_text)
     write_json(out / "data_preparation_plan.json", plan_json)
 
-    rna_source = choose_rna_source(rna_paths, plan_json)
-    tcr_source = choose_tcr_source(tcr_paths, plan_json)
-    h5ad_path, rna_notes = convert_rna_to_h5ad(rna_source, out / "prepared_rna.h5ad")
-    tcr_path, tcr_notes = normalize_tcr_table(tcr_source, out / "prepared_tcr.csv", plan_json)
+    rna_sources = choose_rna_sources(materialized_rna_paths, plan_json)
+    tcr_sources = choose_tcr_sources(materialized_tcr_paths, plan_json)
+    h5ad_path, rna_notes = convert_rna_sources_to_h5ad(rna_sources, out / "prepared_rna.h5ad")
+    tcr_path, tcr_notes = normalize_tcr_tables(tcr_sources, out / "prepared_tcr.csv", plan_json)
 
     manifest = {
         "analysis_name": analysis_name,
         "rna_inputs": [str(path) for path in rna_paths],
         "tcr_inputs": [str(path) for path in tcr_paths],
-        "selected_rna_source": str(rna_source),
-        "selected_tcr_source": str(tcr_source),
+        "materialized_rna_inputs": [str(path) for path in materialized_rna_paths],
+        "materialized_tcr_inputs": [str(path) for path in materialized_tcr_paths],
+        "selected_rna_sources": [str(path) for path in rna_sources],
+        "selected_tcr_sources": [str(path) for path in tcr_sources],
         "rna_h5ad_path": str(h5ad_path),
         "tcr_path": str(tcr_path),
         "llm_plan_path": str(plan_path),
-        "notes": rna_notes + tcr_notes,
+        "notes": rna_archive_notes + tcr_archive_notes + rna_notes + tcr_notes,
         "input_inventory": [summary.to_dict() for summary in all_summaries],
     }
     manifest_path = write_json(out / "prepared_inputs_manifest.json", manifest)
@@ -129,8 +151,35 @@ def prepare_inputs(
         output_dir=str(out),
         plan_path=str(plan_path),
         manifest_path=str(manifest_path),
-        notes=rna_notes + tcr_notes,
+        notes=rna_archive_notes + tcr_archive_notes + rna_notes + tcr_notes,
     )
+
+
+def materialize_input_paths(paths: list[Path], extraction_dir: Path) -> tuple[list[Path], list[str]]:
+    """Return paths that can be recursively searched after unpacking archives."""
+    materialized: list[Path] = []
+    notes: list[str] = []
+    extraction_dir = ensure_dir(extraction_dir)
+    for path in paths:
+        if not path.exists():
+            materialized.append(path)
+            continue
+        if path.is_file() and _is_supported_archive(path):
+            target = extraction_dir / _archive_dir_name(path)
+            _safe_unpack_archive(path, target)
+            materialized.append(target)
+            notes.append(f"Extracted archive {path.name} to {target}.")
+            continue
+        materialized.append(path)
+        if path.is_dir():
+            archives = [child for child in sorted(path.rglob("*")) if child.is_file() and _is_supported_archive(child)]
+            for archive in archives:
+                rel_key = "_".join(archive.relative_to(path).parts)
+                target = extraction_dir / _archive_dir_name(Path(rel_key))
+                _safe_unpack_archive(archive, target)
+                materialized.append(target)
+                notes.append(f"Extracted archive {archive.name} to {target}.")
+    return _dedupe_paths(materialized), notes
 
 
 def summarize_inputs(paths: list[Path], kind_hint: str) -> list[InputFileSummary]:
@@ -160,18 +209,22 @@ def build_llm_preparation_plan(
 {inventory_json}
 
 # Task
-Choose the best RNA source and TCR source for a paired scRNA/scTCR workflow.
-The RNA source must be convertible to an AnnData .h5ad file. The TCR source
-should be a contig, clonotype, AIRR, or other table containing cell barcodes
-and clonotype or receptor-sequence fields.
+Choose the best RNA source(s) and TCR source(s) for a paired scRNA/scTCR
+workflow. Inputs may be project folders containing many sample folders or
+archives. The RNA source(s) must be convertible to one AnnData .h5ad file.
+The TCR source(s) should be contig, clonotype, AIRR, or other tables containing
+cell barcodes and clonotype or receptor-sequence fields. Prefer all compatible
+samples rather than only the first sample.
 
 Return concise notes and this JSON block:
 
 DATA_PREPARATION_PLAN_JSON
 {{
   "rna_source_path": "",
+  "rna_source_paths": [],
   "rna_format": "",
   "tcr_source_path": "",
+  "tcr_source_paths": [],
   "tcr_format": "",
   "barcode_column": "",
   "clonotype_column": "",
@@ -204,23 +257,65 @@ END_DATA_PREPARATION_PLAN_JSON
 
 
 def choose_rna_source(paths: list[Path], plan: dict[str, Any]) -> Path:
-    planned = _path_from_plan(plan.get("rna_source_path"), paths)
-    if planned:
-        return planned
-    candidates = _expand_rna_candidates(paths)
-    if not candidates:
-        raise FileNotFoundError("No supported RNA input source was found.")
-    return candidates[0]
+    return choose_rna_sources(paths, plan)[0]
 
 
 def choose_tcr_source(paths: list[Path], plan: dict[str, Any]) -> Path:
-    planned = _path_from_plan(plan.get("tcr_source_path"), paths)
-    if planned:
-        return planned
+    return choose_tcr_sources(paths, plan)[0]
+
+
+def choose_rna_sources(paths: list[Path], plan: dict[str, Any]) -> list[Path]:
+    candidates = _expand_rna_candidates(paths)
+    if not candidates:
+        raise FileNotFoundError("No supported RNA input source was found.")
+    planned = _paths_from_plan(plan, "rna_source_paths", "rna_source_path", paths)
+    planned_candidates = [path for path in planned if _path_matches_any(path, candidates)]
+    if len(candidates) == 1 and planned_candidates:
+        return planned_candidates[:1]
+    return candidates
+
+
+def choose_tcr_sources(paths: list[Path], plan: dict[str, Any]) -> list[Path]:
     candidates = _expand_tcr_candidates(paths)
     if not candidates:
         raise FileNotFoundError("No supported TCR input table was found.")
-    return candidates[0]
+    planned = _paths_from_plan(plan, "tcr_source_paths", "tcr_source_path", paths)
+    planned_candidates = [path for path in planned if _path_matches_any(path, candidates)]
+    if len(candidates) == 1 and planned_candidates:
+        return planned_candidates[:1]
+    return candidates
+
+
+def convert_rna_sources_to_h5ad(sources: list[Path], destination: Path) -> tuple[Path, list[str]]:
+    sources = _dedupe_paths(sources)
+    if not sources:
+        raise FileNotFoundError("No RNA sources were selected.")
+    if len(sources) == 1:
+        return convert_rna_to_h5ad(sources[0], destination)
+
+    try:
+        import anndata as ad
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError('Install analysis dependencies first: pip install -e ".[analysis]"') from exc
+
+    adatas = []
+    notes = [f"Combining {len(sources)} RNA sources into one AnnData file."]
+    for source in sources:
+        adata, source_notes = _read_rna_source_to_adata(source)
+        sample_id = _infer_sample_id(source)
+        adata.obs["sample_id"] = sample_id
+        adata.obs["input_sample_id"] = sample_id
+        adata.obs["input_source_path"] = str(source)
+        adatas.append(adata)
+        notes.extend(source_notes)
+    combined = ad.concat(adatas, join="outer", merge="same", index_unique=None)
+    combined.uns["scrta_input_sources"] = [str(path) for path in sources]
+    if combined.var_names.has_duplicates:
+        combined.var_names_make_unique()
+        notes.append("Duplicate RNA feature names were made unique.")
+    combined.write_h5ad(destination)
+    notes.append(f"Combined RNA h5ad was written to {destination}.")
+    return destination, notes
 
 
 def convert_rna_to_h5ad(source: Path, destination: Path) -> tuple[Path, list[str]]:
@@ -235,42 +330,8 @@ def convert_rna_to_h5ad(source: Path, destination: Path) -> tuple[Path, list[str
         shutil.copy2(source, destination)
         return destination, ["RNA source was already h5ad and was copied into the prepared input directory."]
 
-    try:
-        import anndata as ad
-        import pandas as pd
-    except Exception as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError('Install analysis dependencies first: pip install -e ".[analysis]"') from exc
-
-    suffix = source.suffix.lower()
-    if source.is_dir():
-        adata = _read_10x_directory(source)
-        notes.append("RNA source was read as a 10x matrix directory.")
-    elif suffix in {".h5", ".hdf5"}:
-        try:
-            import scanpy as sc
-        except Exception as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError('10x HDF5 input requires scanpy: pip install -e ".[analysis]"') from exc
-        adata = sc.read_10x_h5(str(source))
-        notes.append("RNA source was read as a 10x HDF5 matrix.")
-    elif suffix == ".loom":
-        try:
-            import scanpy as sc
-        except Exception as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError('Loom input requires scanpy: pip install -e ".[analysis]"') from exc
-        adata = sc.read_loom(str(source))
-        notes.append("RNA source was read as a loom file.")
-    elif suffix == ".zarr":
-        adata = ad.read_zarr(str(source))
-        notes.append("RNA source was read as an AnnData zarr store.")
-    elif _is_text_table(source):
-        matrix = pd.read_csv(source, sep=_sniff_delimiter(source), index_col=0)
-        if _should_transpose_expression_matrix(matrix):
-            matrix = matrix.T
-            notes.append("RNA text matrix was transposed so observations are cells and variables are genes.")
-        adata = ad.AnnData(matrix)
-        notes.append("RNA source was read as a dense text expression matrix.")
-    else:
-        raise ValueError(f"Unsupported RNA input format: {source}")
+    adata, read_notes = _read_rna_source_to_adata(source)
+    notes.extend(read_notes)
 
     if adata.obs_names.has_duplicates:
         adata.obs_names_make_unique()
@@ -291,10 +352,52 @@ def normalize_tcr_table(source: Path, destination: Path, plan: dict[str, Any] | 
     except Exception as exc:  # pragma: no cover - optional dependency
         raise RuntimeError('TCR table preparation requires pandas: pip install -e ".[analysis]"') from exc
 
+    table, notes = _normalize_tcr_dataframe(source, plan)
+    table.to_csv(destination, index=False)
+    notes.append("TCR table was written with normalized barcode, clonotype_id, clone_size, and clone_size_category fields.")
+    return destination, notes
+
+
+def normalize_tcr_tables(sources: list[Path], destination: Path, plan: dict[str, Any] | None = None) -> tuple[Path, list[str]]:
+    sources = _dedupe_paths([_resolve_tcr_table(source) for source in sources])
+    if not sources:
+        raise FileNotFoundError("No TCR tables were selected.")
+    try:
+        import pandas as pd
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError('TCR table preparation requires pandas: pip install -e ".[analysis]"') from exc
+
+    tables = []
+    notes = [f"Combining {len(sources)} TCR table sources into one normalized table."]
+    for source in sources:
+        table, source_notes = _normalize_tcr_dataframe(source, plan)
+        sample_id = _infer_sample_id(source)
+        if "sample_id" not in table.columns:
+            table["sample_id"] = sample_id
+        if "input_sample_id" not in table.columns:
+            table["input_sample_id"] = sample_id
+        table["input_source_path"] = str(source)
+        tables.append(table)
+        notes.extend(source_notes)
+    combined = pd.concat(tables, ignore_index=True, sort=False)
+    clone_sizes = combined.groupby("clonotype_id", dropna=False)["barcode"].transform("nunique")
+    combined["clone_size"] = clone_sizes.astype(int)
+    combined["clone_size_category"] = combined["clone_size"].map(clone_size_category)
+    combined.to_csv(destination, index=False)
+    notes.append(f"Combined TCR table was written to {destination}.")
+    return destination, notes
+
+
+def _normalize_tcr_dataframe(source: Path, plan: dict[str, Any] | None = None):
+    try:
+        import pandas as pd
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError('TCR table preparation requires pandas: pip install -e ".[analysis]"') from exc
+
+    plan = plan or {}
     sep = _sniff_delimiter(source)
     table = pd.read_csv(source, sep=sep)
     notes = [f"TCR table was read from {source.name}."]
-    plan = plan or {}
     barcode_col = _choose_column(
         table.columns,
         str(plan.get("barcode_column") or ""),
@@ -329,9 +432,7 @@ def normalize_tcr_table(source: Path, destination: Path, plan: dict[str, Any] | 
     clone_sizes = table.groupby("clonotype_id", dropna=False)["barcode"].transform("nunique")
     table["clone_size"] = clone_sizes.astype(int)
     table["clone_size_category"] = table["clone_size"].map(clone_size_category)
-    table.to_csv(destination, index=False)
-    notes.append("TCR table was written with normalized barcode, clonotype_id, clone_size, and clone_size_category fields.")
-    return destination, notes
+    return table, notes
 
 
 def clone_size_category(size: int) -> str:
@@ -348,8 +449,99 @@ def clone_size_category(size: int) -> str:
     return "Ultraexpanded"
 
 
+def _read_rna_source_to_adata(source: Path):
+    source = source.resolve()
+    notes: list[str] = []
+    try:
+        import anndata as ad
+        import pandas as pd
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError('Install analysis dependencies first: pip install -e ".[analysis]"') from exc
+
+    suffix = source.suffix.lower()
+    if source.suffix.lower() == ".h5ad":
+        adata = ad.read_h5ad(source)
+        notes.append(f"RNA source {source.name} was read as h5ad.")
+    elif source.is_dir():
+        adata = _read_10x_directory(source)
+        notes.append(f"RNA source {source.name} was read as a 10x matrix directory.")
+    elif suffix in {".h5", ".hdf5"}:
+        try:
+            import scanpy as sc
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError('10x HDF5 input requires scanpy: pip install -e ".[analysis]"') from exc
+        adata = sc.read_10x_h5(str(source))
+        notes.append(f"RNA source {source.name} was read as a 10x HDF5 matrix.")
+    elif suffix == ".loom":
+        try:
+            import scanpy as sc
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError('Loom input requires scanpy: pip install -e ".[analysis]"') from exc
+        adata = sc.read_loom(str(source))
+        notes.append(f"RNA source {source.name} was read as a loom file.")
+    elif suffix == ".zarr":
+        adata = ad.read_zarr(str(source))
+        notes.append(f"RNA source {source.name} was read as an AnnData zarr store.")
+    elif _is_text_table(source):
+        matrix = pd.read_csv(source, sep=_sniff_delimiter(source), index_col=0)
+        if _should_transpose_expression_matrix(matrix):
+            matrix = matrix.T
+            notes.append(f"RNA text matrix {source.name} was transposed so observations are cells and variables are genes.")
+        adata = ad.AnnData(matrix)
+        notes.append(f"RNA source {source.name} was read as a dense text expression matrix.")
+    else:
+        raise ValueError(f"Unsupported RNA input format: {source}")
+    return adata, notes
+
+
 def _split_path_string(raw: str) -> list[str]:
     return [part.strip().strip('"') for part in re.split(r";|\n", raw) if part.strip()]
+
+
+def _is_supported_archive(path: Path) -> bool:
+    name = path.name.lower()
+    return any(name.endswith(suffix) for suffix in ARCHIVE_SUFFIXES)
+
+
+def _archive_dir_name(path: Path) -> str:
+    name = path.name
+    for suffix in ARCHIVE_SUFFIXES:
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", name).strip("._-")
+    return safe or "archive"
+
+
+def _safe_unpack_archive(archive: Path, destination: Path) -> None:
+    destination = ensure_dir(destination)
+    root = destination.resolve()
+    if zipfile.is_zipfile(archive):
+        with zipfile.ZipFile(archive) as zf:
+            for member in zf.infolist():
+                target = (destination / member.filename).resolve()
+                if not _is_within_directory(root, target):
+                    raise ValueError(f"Archive member escapes extraction directory: {member.filename}")
+            zf.extractall(destination)
+        return
+    if tarfile.is_tarfile(archive):
+        with tarfile.open(archive) as tf:
+            members = tf.getmembers()
+            for member in members:
+                target = (destination / member.name).resolve()
+                if not _is_within_directory(root, target):
+                    raise ValueError(f"Archive member escapes extraction directory: {member.name}")
+            tf.extractall(destination, members=members)
+        return
+    raise ValueError(f"Unsupported archive format: {archive}")
+
+
+def _is_within_directory(root: Path, target: Path) -> bool:
+    try:
+        target.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _summarize_path(path: Path, kind_hint: str) -> InputFileSummary:
@@ -390,8 +582,10 @@ def _deterministic_plan(summaries: list[InputFileSummary]) -> dict[str, Any]:
     tcr = _expand_tcr_candidates(tcr_paths)
     return {
         "rna_source_path": str(rna[0]) if rna else "",
+        "rna_source_paths": [str(path) for path in rna],
         "rna_format": _format_label(rna[0]) if rna else "",
         "tcr_source_path": str(tcr[0]) if tcr else "",
+        "tcr_source_paths": [str(path) for path in tcr],
         "tcr_format": _format_label(tcr[0]) if tcr else "",
         "barcode_column": "",
         "clonotype_column": "",
@@ -406,15 +600,30 @@ def _expand_rna_candidates(paths: list[Path]) -> list[Path]:
         if not path.exists():
             continue
         if path.is_dir():
-            for nested in ["filtered_feature_bc_matrix", "raw_feature_bc_matrix"]:
+            for nested in [
+                "filtered_feature_bc_matrix",
+                "raw_feature_bc_matrix",
+                "filtered_feature_bc_matrix_mex",
+                "raw_feature_bc_matrix_mex",
+            ]:
                 if _looks_like_10x_matrix_dir(path / nested):
                     candidates.append(path / nested)
             if _looks_like_10x_matrix_dir(path):
                 candidates.append(path)
             candidates.extend(
-                child for child in sorted(path.rglob("*")) if child.is_file() and _looks_like_rna_file(child)
+                child for child in sorted(path.rglob("*")) if child.is_dir() and _looks_like_10x_matrix_dir(child)
             )
-        elif _looks_like_rna_file(path):
+            candidates.extend(
+                child
+                for child in sorted(path.rglob("*"))
+                if child.is_file()
+                and not _is_10x_member_file(child)
+                and not _looks_like_tcr_file(child)
+                and _looks_like_rna_file(child)
+            )
+        elif _is_10x_member_file(path) and _looks_like_10x_matrix_dir(path.parent):
+            candidates.append(path.parent)
+        elif not _looks_like_tcr_file(path) and _looks_like_rna_file(path):
             candidates.append(path)
     return _dedupe_paths(candidates)
 
@@ -448,13 +657,35 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
 
 def _looks_like_rna_file(path: Path) -> bool:
     name = path.name.lower()
-    if name.endswith((".csv.gz", ".tsv.gz", ".txt.gz", ".mtx.gz")):
+    if _is_supported_archive(path):
+        return False
+    if _is_10x_member_file(path):
+        return False
+    if any(token in str(path).lower() for token in ("vdj", "tcr", "contig", "clonotype", "airr")):
+        return False
+    if name.endswith((".csv.gz", ".tsv.gz", ".txt.gz")):
         return True
     return path.suffix.lower() in RNA_FILE_SUFFIXES
 
 
+def _is_10x_member_file(path: Path) -> bool:
+    name = path.name.lower()
+    return name in {
+        "matrix.mtx",
+        "matrix.mtx.gz",
+        "barcodes.tsv",
+        "barcodes.tsv.gz",
+        "features.tsv",
+        "features.tsv.gz",
+        "genes.tsv",
+        "genes.tsv.gz",
+    }
+
+
 def _looks_like_tcr_file(path: Path) -> bool:
     name = path.name.lower()
+    if _is_supported_archive(path):
+        return False
     if name in TCR_FILE_NAMES:
         return True
     if name.endswith((".csv.gz", ".tsv.gz", ".txt.gz")):
@@ -548,6 +779,39 @@ def _choose_column(columns, planned: str, candidates: list[str]) -> str:
     return ""
 
 
+def _paths_from_plan(plan: dict[str, Any], list_key: str, single_key: str, allowed_roots: list[Path]) -> list[Path]:
+    raw_values: list[Any] = []
+    list_value = plan.get(list_key)
+    if isinstance(list_value, list):
+        raw_values.extend(list_value)
+    elif isinstance(list_value, str) and list_value.strip():
+        raw_values.extend(_split_path_string(list_value))
+    single_value = plan.get(single_key)
+    if single_value:
+        raw_values.append(single_value)
+    paths: list[Path] = []
+    for value in raw_values:
+        path = _path_from_plan(value, allowed_roots)
+        if path:
+            paths.append(path)
+    return _dedupe_paths(paths)
+
+
+def _path_matches_any(path: Path, candidates: list[Path]) -> bool:
+    resolved = path.resolve()
+    candidate_set = {str(candidate.resolve()).lower() for candidate in candidates}
+    if str(resolved).lower() in candidate_set:
+        return True
+    if resolved.is_dir():
+        for candidate in candidates:
+            try:
+                candidate.resolve().relative_to(resolved)
+                return True
+            except ValueError:
+                continue
+    return False
+
+
 def _path_from_plan(value: Any, allowed_roots: list[Path]) -> Path | None:
     if not value:
         return None
@@ -576,6 +840,41 @@ def _format_label(path: Path) -> str:
     if _is_text_table(path):
         return "text_table"
     return path.suffix.lower().lstrip(".")
+
+
+def _infer_sample_id(path: Path) -> str:
+    path = path.resolve()
+    name = path.name
+    if name.lower() in {
+        "filtered_feature_bc_matrix",
+        "raw_feature_bc_matrix",
+        "filtered_feature_bc_matrix_mex",
+        "raw_feature_bc_matrix_mex",
+    } and path.parent.name:
+        name = path.parent.name
+    generic_file_names = {
+        "rna",
+        "expression",
+        "matrix",
+        "counts",
+        "filtered_contig_annotations",
+        "all_contig_annotations",
+        "contig_annotations",
+        "clonotypes",
+        "airr_rearrangement",
+    }
+    for suffix in ARCHIVE_SUFFIXES:
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    for suffix in [".h5ad", ".hdf5", ".h5", ".csv", ".tsv", ".txt", ".gz", ".loom", ".zarr"]:
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    if name.lower() in generic_file_names and path.parent.name:
+        name = path.parent.name
+    sample = re.sub(r"[^a-zA-Z0-9._-]+", "_", name).strip("._-")
+    return sample or "sample"
 
 
 def _extract_json_block(text: str, marker: str) -> dict[str, Any]:
