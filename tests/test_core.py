@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from scrta_agent.agents import ScRTATeam
+from scrta_agent.data_import import clone_size_category, split_user_paths
 from scrta_agent.deep_dive import DeepDiveSelection
 from scrta_agent.llm import LLMClient
 from scrta_agent.rag import RagChunk, retrieve_rag_chunks
@@ -224,3 +225,13 @@ def test_rag_query_expands_known_geo_accession() -> None:
     ]
     hits = retrieve_rag_chunks(chunks, "GSE235863 paired scRNA scTCR analysis", limit=1)
     assert hits[0].doc_id == "39889705"
+
+
+def test_interactive_path_split_and_clone_bins() -> None:
+    paths = split_user_paths("a; b\nc")
+    assert [path.name for path in paths] == ["a", "b", "c"]
+    assert clone_size_category(1) == "Single"
+    assert clone_size_category(5) == "Small"
+    assert clone_size_category(20) == "Medium"
+    assert clone_size_category(100) == "Large"
+    assert clone_size_category(500) == "Hyperexpanded"

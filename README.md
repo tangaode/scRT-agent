@@ -15,6 +15,11 @@ orthogonal evidence.
 
 ## Features
 
+- Guided interactive workflow through `scrta-agent interactive` or `gui.bat`.
+- LLM-assisted input preparation for common scRNA-seq and scTCR-seq file
+  layouts, producing a workflow-ready RNA `.h5ad` file and normalized TCR
+  table.
+- User-controlled hypothesis selection and editing before the deep-dive stage.
 - Dataset profiling for `.h5ad` scRNA-seq objects and tabular scTCR files.
 - Standard paired scRNA/scTCR analysis script generation.
 - T-cell subclustering and marker-based state annotation support.
@@ -55,6 +60,21 @@ Useful RNA metadata columns include patient, sample, tissue, condition,
 timepoint, response group, cluster and cell type. The workflow attempts to
 profile available metadata and infer join keys before analysis.
 
+The interactive preparation layer can also start from common raw or processed
+inputs:
+
+- RNA `.h5ad` files.
+- 10x `filtered_feature_bc_matrix` or `raw_feature_bc_matrix` directories.
+- 10x HDF5 gene-expression matrices.
+- Dense text expression matrices in CSV, TSV or TXT format.
+- Loom or AnnData zarr stores when the required Python readers are installed.
+- 10x VDJ contig tables, clonotype tables, AIRR TSV files, or other tabular TCR
+  files with barcode and clonotype or receptor-sequence fields.
+
+Large matrices are never sent to the LLM. The LLM reviews a file inventory and
+proposes a preparation plan; conversion is performed locally with standard
+Python readers.
+
 ## LLM Configuration
 
 Set one of the following API keys before running the workflow:
@@ -75,6 +95,27 @@ The default model can be overridden with `--model`.
 
 ## Quick Start
 
+For the guided workflow:
+
+```bash
+scrta-agent interactive
+```
+
+On Windows, double-click `gui.bat` from the repository root after installation
+or run it from a terminal.
+
+To prepare inputs without launching the full workflow:
+
+```bash
+scrta-agent prepare \
+  --rna-input /path/to/filtered_feature_bc_matrix \
+  --tcr-input /path/to/filtered_contig_annotations.csv \
+  --out ./prepared_inputs/example \
+  --analysis-name example_scrna_sctcr
+```
+
+Then run the main workflow on the prepared files:
+
 ```bash
 scrta-agent run \
   --rna /path/to/sample.h5ad \
@@ -83,6 +124,19 @@ scrta-agent run \
   --out ./runs \
   --brief "Identify RNA-defined T-cell states with conservative TCR lineage support." \
   --execute
+```
+
+To manually choose and edit the selected hypothesis after LLM hypothesis
+generation:
+
+```bash
+scrta-agent run \
+  --rna /path/to/sample.h5ad \
+  --tcr /path/to/filtered_contig_annotations.csv \
+  --analysis-name example_interactive_selection \
+  --out ./runs \
+  --execute \
+  --interactive-hypothesis-selection
 ```
 
 With a local RAG index:
@@ -163,6 +217,8 @@ scrta-agent run --config examples/config.example.json
 Important options:
 
 - `--execute`: run the generated analysis script.
+- `--interactive-hypothesis-selection`: pause after hypothesis generation so
+  the user can select and edit the hypothesis before deep-dive analysis.
 - `--repair-attempts N`: retry script execution after transient failures.
 - `--script-timeout SECONDS`: set script execution timeout.
 - `--rag-index PATH`: inject local RAG chunks into agent prompts.

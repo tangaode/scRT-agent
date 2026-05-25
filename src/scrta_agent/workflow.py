@@ -12,6 +12,7 @@ from .execution import execute_python_script
 from .deep_dive import (
     DeepDiveSelection,
     extract_hypothesis_candidates,
+    normalize_hypothesis_id,
     selection_from_agent_response,
     support_decision_from_result_interpreter,
 )
@@ -562,115 +563,125 @@ class ScRTAWorkflow:
         )
         self._add_artifact(state, "hypothesis_candidate_index", candidate_index_path)
 
-        deep_context = dict(base_context)
-        compact_candidates = {
-            "source": "hypothesis_generator",
-            "selection_instruction": (
-                "Select exactly one ID from this JSON. Preserve the selected "
-                "candidate's hypothesis_statement and plain_language_explanation."
-            ),
-            "candidates": [
-                {
-                    "hypothesis_id": hyp_id,
-                    "title": candidate.get("title", ""),
-                    "hypothesis_statement": candidate.get("hypothesis_statement", ""),
-                    "plain_language_explanation": candidate.get("plain_language_explanation", ""),
-                    "prior_literature_pattern": (candidate.get("raw") or {}).get("prior_literature_pattern", ""),
-                    "current_dataset_clue": (candidate.get("raw") or {}).get("current_dataset_clue", ""),
-                    "innovative_claim": (candidate.get("raw") or {}).get("innovative_claim", ""),
-                    "key_validation": (candidate.get("raw") or {}).get("key_validation", ""),
-                    "falsification_criteria": (candidate.get("raw") or {}).get("falsification_criteria", ""),
-                    "required_output_tables": (candidate.get("raw") or {}).get("required_output_tables", []),
-                }
-                for hyp_id, candidate in sorted(generated_candidates.items())
-            ],
-        }
-        # Put the compact candidate block under an early-sorting key so the
-        # selector sees it even when large reconnaissance context is truncated.
-        deep_context["aa_hypothesis_candidates_for_selection"] = json.dumps(
-            compact_candidates,
-            ensure_ascii=False,
-            indent=2,
-        )
-        deep_context["dataset_reconnaissance_context"] = dataset_reconnaissance_context
-        deep_context["rag_grounded_hypothesis_candidates"] = generator.content
-        deep_context["hypothesis_candidate_index"] = read_text(candidate_index_path)
-        selector = self._call_and_store(
-            team,
-            store,
-            state,
-            "hypothesis_selector",
-            (
-                "Select the hypothesis that should enter a targeted deep-dive loop. "
-                "Choose exactly one ID from the RAG-grounded hypothesis_generator "
-                "candidates. Use dataset reconnaissance outputs only as permissive context about "
-                "feasibility and immediate testability. Do not invent a new hypothesis, "
-                "do not use any hard-coded selection menu, and do not rewrite the selected "
-                "candidate into a different biological claim. "
-                "End with the required JSON block."
-            ),
-            self._context_with_rag(
-                deep_context,
-                rag_chunks,
-                "select hypothesis for deep validation after dataset reconnaissance scRNA scTCR results",
+        if self.config.interactive_hypothesis_selection:
+            selection, selector_response = self._select_hypothesis_interactively(
+                generated_candidates=generated_candidates,
                 store=store,
                 state=state,
-                agent_name="hypothesis_selector",
-            ),
-        )
-        responses.append(selector)
-
-        try:
-            selection = selection_from_agent_response(selector.content, generated_candidates)
-        except ValueError as exc:
-            error_path = store.write_markdown(
-                "hypothesis_selection_error",
+            )
+            responses.append(selector_response)
+            selector_review_content = selector_response.content
+        else:
+            deep_context = dict(base_context)
+            compact_candidates = {
+                "source": "hypothesis_generator",
+                "selection_instruction": (
+                    "Select exactly one ID from this JSON. Preserve the selected "
+                    "candidate's hypothesis_statement and plain_language_explanation."
+                ),
+                "candidates": [
+                    {
+                        "hypothesis_id": hyp_id,
+                        "title": candidate.get("title", ""),
+                        "hypothesis_statement": candidate.get("hypothesis_statement", ""),
+                        "plain_language_explanation": candidate.get("plain_language_explanation", ""),
+                        "prior_literature_pattern": (candidate.get("raw") or {}).get("prior_literature_pattern", ""),
+                        "current_dataset_clue": (candidate.get("raw") or {}).get("current_dataset_clue", ""),
+                        "innovative_claim": (candidate.get("raw") or {}).get("innovative_claim", ""),
+                        "key_validation": (candidate.get("raw") or {}).get("key_validation", ""),
+                        "falsification_criteria": (candidate.get("raw") or {}).get("falsification_criteria", ""),
+                        "required_output_tables": (candidate.get("raw") or {}).get("required_output_tables", []),
+                    }
+                    for hyp_id, candidate in sorted(generated_candidates.items())
+                ],
+            }
+            # Put the compact candidate block under an early-sorting key so the
+            # selector sees it even when large reconnaissance context is truncated.
+            deep_context["aa_hypothesis_candidates_for_selection"] = json.dumps(
+                compact_candidates,
+                ensure_ascii=False,
+                indent=2,
+            )
+            deep_context["dataset_reconnaissance_context"] = dataset_reconnaissance_context
+            deep_context["rag_grounded_hypothesis_candidates"] = generator.content
+            deep_context["hypothesis_candidate_index"] = read_text(candidate_index_path)
+            selector = self._call_and_store(
+                team,
+                store,
+                state,
+                "hypothesis_selector",
                 (
-                    "# Hypothesis Selection Error\n\n"
-                    "The LLM hypothesis_selector did not return a valid selection from "
-                    "the LLM-generated candidate IDs. The workflow stops instead of "
-                    "using a deterministic fallback selection.\n\n"
-                    f"Error: {exc}\n"
+                    "Select the hypothesis that should enter a targeted deep-dive loop. "
+                    "Choose exactly one ID from the RAG-grounded hypothesis_generator "
+                    "candidates. Use dataset reconnaissance outputs only as permissive context about "
+                    "feasibility and immediate testability. Do not invent a new hypothesis, "
+                    "do not use any hard-coded selection menu, and do not rewrite the selected "
+                    "candidate into a different biological claim. "
+                    "End with the required JSON block."
+                ),
+                self._context_with_rag(
+                    deep_context,
+                    rag_chunks,
+                    "select hypothesis for deep validation after dataset reconnaissance scRNA scTCR results",
+                    store=store,
+                    state=state,
+                    agent_name="hypothesis_selector",
                 ),
             )
-            self._add_artifact(state, "hypothesis_selection_error", error_path)
-            raise
-        selection_payload = selection.to_dict()
-        selection_payload["generator_candidate_count"] = len(generated_candidates)
-        selection_payload["selection_provenance"] = (
-            "The LLM hypothesis_generator first generated multiple candidates after RAG "
-            "retrieval and dataset reconnaissance review. The LLM hypothesis_selector then "
-            "selected exactly one candidate ID from that generator output. Reconnaissance "
-            "tables were available only as context for feasibility and were not used to "
-            "create a separate hard-coded hypothesis-selection table or built-in hypothesis menu. "
-            "If the selector output is malformed, the workflow fails rather than selecting "
-            "a deterministic fallback candidate."
-        )
-        selection_payload["llm_hypothesis_generator_artifact"] = "rag_grounded_hypothesis_candidates.md"
-        selection_payload["llm_selector_artifact"] = "agent_hypothesis_selector.md"
-        selection_payload["candidate_index_artifact"] = "hypothesis_candidate_index.json"
-        selection_json = store.write_json("selected_hypothesis", selection_payload)
-        selection_md_text = (
-            selection.to_markdown()
-            + "\n## Selection Provenance\n"
-            + "This hypothesis was selected after `hypothesis_generator` generated "
-            + "RAG-grounded candidates and `agent_hypothesis_selector` chose one "
-            + "candidate ID with injected RAG evidence and optional dataset reconnaissance context. "
-            + "No built-in hypothesis-selection table is generated. Inspect "
-            + "`rag_context_hypothesis_generator.md`, "
-            + "`rag_grounded_hypothesis_candidates.md`, "
-            + "`rag_context_hypothesis_selector.md`, and "
-            + "`agent_hypothesis_selector.md` to audit the sequence. Malformed selector "
-            + "output causes workflow failure; no deterministic hypothesis fallback is used.\n"
-        )
-        selection_md = store.write_markdown("selected_hypothesis", selection_md_text)
-        self._add_artifact(state, "selected_hypothesis_json", selection_json)
-        self._add_artifact(state, "selected_hypothesis", selection_md)
+            responses.append(selector)
+            selector_review_content = selector.content
+
+            try:
+                selection = selection_from_agent_response(selector.content, generated_candidates)
+            except ValueError as exc:
+                error_path = store.write_markdown(
+                    "hypothesis_selection_error",
+                    (
+                        "# Hypothesis Selection Error\n\n"
+                        "The LLM hypothesis_selector did not return a valid selection from "
+                        "the LLM-generated candidate IDs. The workflow stops instead of "
+                        "using a deterministic fallback selection.\n\n"
+                        f"Error: {exc}\n"
+                    ),
+                )
+                self._add_artifact(state, "hypothesis_selection_error", error_path)
+                raise
+            selection_payload = selection.to_dict()
+            selection_payload["generator_candidate_count"] = len(generated_candidates)
+            selection_payload["selection_provenance"] = (
+                "The LLM hypothesis_generator first generated multiple candidates after RAG "
+                "retrieval and dataset reconnaissance review. The LLM hypothesis_selector then "
+                "selected exactly one candidate ID from that generator output. Reconnaissance "
+                "tables were available only as context for feasibility and were not used to "
+                "create a separate hard-coded hypothesis-selection table or built-in hypothesis menu. "
+                "If the selector output is malformed, the workflow fails rather than selecting "
+                "a deterministic fallback candidate."
+            )
+            selection_payload["llm_hypothesis_generator_artifact"] = "rag_grounded_hypothesis_candidates.md"
+            selection_payload["llm_selector_artifact"] = "agent_hypothesis_selector.md"
+            selection_payload["candidate_index_artifact"] = "hypothesis_candidate_index.json"
+            selection_json = store.write_json("selected_hypothesis", selection_payload)
+            selection_md_text = (
+                selection.to_markdown()
+                + "\n## Selection Provenance\n"
+                + "This hypothesis was selected after `hypothesis_generator` generated "
+                + "RAG-grounded candidates and `agent_hypothesis_selector` chose one "
+                + "candidate ID with injected RAG evidence and optional dataset reconnaissance context. "
+                + "No built-in hypothesis-selection table is generated. Inspect "
+                + "`rag_context_hypothesis_generator.md`, "
+                + "`rag_grounded_hypothesis_candidates.md`, "
+                + "`rag_context_hypothesis_selector.md`, and "
+                + "`agent_hypothesis_selector.md` to audit the sequence. Malformed selector "
+                + "output causes workflow failure; no deterministic hypothesis fallback is used.\n"
+            )
+            selection_md = store.write_markdown("selected_hypothesis", selection_md_text)
+            self._add_artifact(state, "selected_hypothesis_json", selection_json)
+            self._add_artifact(state, "selected_hypothesis", selection_md)
 
         planner_context = dict(base_context)
         planner_context["selected_hypothesis"] = selection.to_markdown()
         planner_context["rag_grounded_hypothesis_candidates"] = generator.content
-        planner_context["rag_grounded_selector_review"] = selector.content
+        planner_context["rag_grounded_selector_review"] = selector_review_content
         planner_context["dataset_reconnaissance_context"] = dataset_reconnaissance_context
         planner_context["deep_dive_runtime_contract"] = self._render_deep_dive_runtime_contract(state.run_dir)
         planner = self._call_and_store(
@@ -790,6 +801,110 @@ class ScRTAWorkflow:
                     )
             self._write_hypothesis_refinement_summary(store, state, rejected_hypotheses)
         return responses
+
+    def _select_hypothesis_interactively(
+        self,
+        generated_candidates: dict[str, dict[str, object]],
+        store: ArtifactStore,
+        state: WorkflowState,
+    ) -> tuple[DeepDiveSelection, AgentResponse]:
+        print("")
+        print("Generated hypothesis candidates")
+        print("--------------------------------")
+        for hyp_id, candidate in sorted(generated_candidates.items()):
+            print(f"{hyp_id}: {candidate.get('title', '')}")
+            statement = str(candidate.get("hypothesis_statement") or "").strip()
+            explanation = str(candidate.get("plain_language_explanation") or "").strip()
+            if statement:
+                print(f"  Hypothesis: {statement}")
+            if explanation:
+                print(f"  Explanation: {explanation}")
+            print("")
+
+        available = sorted(generated_candidates)
+        selected_id = ""
+        while selected_id not in generated_candidates:
+            raw = input(f"Select hypothesis ID ({', '.join(available)}): ").strip()
+            selected_id = normalize_hypothesis_id(raw)
+            if selected_id not in generated_candidates:
+                print("Please enter one of the displayed hypothesis IDs.")
+
+        candidate = generated_candidates[selected_id]
+        raw_candidate = candidate.get("raw") if isinstance(candidate.get("raw"), dict) else {}
+        title = _interactive_edit("Title", str(candidate.get("title") or selected_id))
+        statement = _interactive_edit("Hypothesis statement", str(candidate.get("hypothesis_statement") or ""))
+        explanation = _interactive_edit(
+            "Explanation",
+            str(candidate.get("plain_language_explanation") or ""),
+            multiline=True,
+        )
+        required_tests = _interactive_edit_list(
+            "Required tests",
+            raw_candidate.get("key_validation")
+            if isinstance(raw_candidate.get("key_validation"), list)
+            else [str(raw_candidate.get("key_validation") or "Run targeted validation for the selected hypothesis.")],
+        )
+        falsification_criteria = _interactive_edit_list(
+            "Falsification criteria",
+            raw_candidate.get("falsification_criteria")
+            if isinstance(raw_candidate.get("falsification_criteria"), list)
+            else [
+                str(
+                    raw_candidate.get("falsification_criteria")
+                    or "The targeted validation analyses do not support the selected hypothesis."
+                )
+            ],
+        )
+        source_tables = _interactive_edit_list(
+            "Source tables",
+            raw_candidate.get("required_output_tables")
+            if isinstance(raw_candidate.get("required_output_tables"), list)
+            else ["rag_grounded_hypothesis_candidates.md"],
+        )
+
+        selection = DeepDiveSelection(
+            hypothesis_id=selected_id,
+            title=title,
+            selected_hypothesis=statement,
+            plain_language_explanation=explanation,
+            rationale="Selected and optionally edited through the interactive workflow.",
+            required_tests=required_tests,
+            falsification_criteria=falsification_criteria,
+            source_tables=source_tables,
+            selected_candidate_source="interactive_hypothesis_selection",
+            selected_candidate_text=str(candidate.get("source_text") or "").strip(),
+            selection_mode="interactive_candidate_selection_for_deep_dive",
+            data_support_level="not_assessed",
+        )
+        selection_payload = selection.to_dict()
+        selection_payload["generator_candidate_count"] = len(generated_candidates)
+        selection_payload["selection_provenance"] = (
+            "The LLM hypothesis_generator produced candidates. The user then selected "
+            "one candidate and could edit the title, hypothesis statement, explanation, "
+            "required tests, falsification criteria, and source tables before deep-dive execution."
+        )
+        selection_payload["llm_hypothesis_generator_artifact"] = "rag_grounded_hypothesis_candidates.md"
+        selection_payload["candidate_index_artifact"] = "hypothesis_candidate_index.json"
+        selection_json = store.write_json("selected_hypothesis", selection_payload)
+        selection_md = store.write_markdown(
+            "selected_hypothesis",
+            selection.to_markdown()
+            + "\n## Selection Provenance\n"
+            + selection_payload["selection_provenance"]
+            + "\n",
+        )
+        self._add_artifact(state, "selected_hypothesis_json", selection_json)
+        self._add_artifact(state, "selected_hypothesis", selection_md)
+        response = AgentResponse(
+            agent_name="interactive_hypothesis_selection",
+            content=selection.to_markdown(),
+            metadata={"mode": "interactive", "role": "human_candidate_selection"},
+        )
+        selector_path = store.write_markdown("agent_interactive_hypothesis_selection", response.content)
+        self._add_artifact(state, "agent_interactive_hypothesis_selection", selector_path)
+        selector_meta = store.write_json("agent_interactive_hypothesis_selection_metadata", asdict(response))
+        self._add_artifact(state, "agent_interactive_hypothesis_selection_metadata", selector_meta)
+        return selection, response
 
     def _run_hypothesis_refinement_attempts(
         self,
@@ -2465,3 +2580,46 @@ class ScRTAWorkflow:
     @staticmethod
     def _add_artifact(state: WorkflowState, name: str, path: str | Path) -> None:
         state.add_artifact(name, path)
+
+
+def _interactive_edit(label: str, current: str, multiline: bool = False) -> str:
+    print("")
+    print(f"{label}:")
+    if current:
+        print(current)
+    if multiline:
+        print("Enter replacement text. Submit an empty line immediately to keep the current text.")
+        print("End replacement text with a line containing only a single period.")
+        first = input("> ")
+        if not first.strip():
+            return current
+        lines = [first]
+        while True:
+            line = input("> ")
+            if line.strip() == ".":
+                break
+            lines.append(line)
+        replacement = "\n".join(lines).strip()
+        return replacement or current
+    replacement = input("Replacement (blank keeps current): ").strip()
+    return replacement or current
+
+
+def _interactive_edit_list(label: str, current: object) -> list[str]:
+    values: list[str]
+    if isinstance(current, list):
+        values = [str(item).strip() for item in current if str(item).strip()]
+    elif current:
+        values = [str(current).strip()]
+    else:
+        values = []
+    print("")
+    print(f"{label}:")
+    for item in values:
+        print(f"- {item}")
+    print("Enter replacement items separated by semicolons, or leave blank to keep current.")
+    replacement = input("Replacement list: ").strip()
+    if not replacement:
+        return values
+    edited = [item.strip() for item in replacement.split(";") if item.strip()]
+    return edited or values

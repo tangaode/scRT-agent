@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from .agents import ScRTATeam
+from .data_import import prepare_inputs
+from .interactive import run_interactive_wizard
 from .llm import LLMClient
 from .schemas import WorkflowConfig
 from .workflow import ScRTAWorkflow
@@ -34,6 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--analysis-loops", dest="analysis_loops", type=int, default=None, help="planned analysis loop count")
     run.add_argument("--repair-attempts", dest="repair_attempts", type=int, default=None, help="script rerun attempts after failure")
     run.add_argument("--script-timeout", dest="script_timeout_seconds", type=int, default=None, help="script timeout in seconds")
+    run.add_argument(
+        "--interactive-hypothesis-selection",
+        action="store_true",
+        help="pause after hypothesis generation so the user can select and edit the hypothesis",
+    )
     run.add_argument("--no-deep-dive", dest="deep_dive_enabled", action="store_false", help="disable hypothesis deep-dive loop")
     run.add_argument(
         "--no-mechanism-loop",
@@ -50,6 +57,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     agents = subparsers.add_parser("agents", help="list fixed role agents")
     agents.add_argument("--json", action="store_true", help="print JSON")
+
+    prepare = subparsers.add_parser("prepare", help="prepare user input files for the workflow")
+    prepare.add_argument("--rna-input", nargs="+", required=True, help="RNA input path(s)")
+    prepare.add_argument("--tcr-input", nargs="+", required=True, help="TCR input path(s)")
+    prepare.add_argument("--out", required=True, help="prepared input output directory")
+    prepare.add_argument("--analysis-name", default="scrna_sctcr_case", help="analysis name")
+    prepare.add_argument("--model", default=None, help="LLM model name")
+    prepare.add_argument("--no-llm-plan", action="store_true", help="use deterministic input selection")
+
+    subparsers.add_parser("interactive", help="start the guided interactive workflow")
     return parser
 
 
@@ -75,6 +92,24 @@ def main(argv: list[str] | None = None) -> int:
         for name, path in sorted(state.artifacts.items()):
             print(f"- {name}: {path}")
         return 0
+
+    if args.command == "prepare":
+        llm = LLMClient(model=args.model or "gpt-5.4", use_llm=not args.no_llm_plan)
+        result = prepare_inputs(
+            rna_inputs=args.rna_input,
+            tcr_inputs=args.tcr_input,
+            output_dir=args.out,
+            llm=llm,
+            analysis_name=args.analysis_name,
+            require_llm_plan=not args.no_llm_plan,
+        )
+        print(f"Prepared RNA h5ad: {result.rna_h5ad_path}")
+        print(f"Prepared TCR table: {result.tcr_path}")
+        print(f"Manifest: {result.manifest_path}")
+        return 0
+
+    if args.command == "interactive":
+        return run_interactive_wizard()
 
     parser.print_help()
     return 0
@@ -109,6 +144,8 @@ def _build_config(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     if args.execute:
         data["execute_script"] = True
     data["use_llm"] = True
+    if args.interactive_hypothesis_selection:
+        data["interactive_hypothesis_selection"] = True
     if args.deep_dive_enabled is False:
         data["deep_dive_enabled"] = False
     if args.mechanism_loop_enabled is False:
