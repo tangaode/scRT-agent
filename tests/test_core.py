@@ -9,6 +9,7 @@ from scrta_agent.agents import ScRTATeam
 from scrta_agent.data_import import choose_tcr_sources, clone_size_category, materialize_input_paths, split_user_paths
 from scrta_agent.deep_dive import DeepDiveSelection
 from scrta_agent.llm import LLMClient
+import scrta_agent.llm as llm_module
 from scrta_agent.rag import RagChunk, retrieve_rag_chunks
 from scrta_agent.schemas import WorkflowConfig
 from scrta_agent.script_writer import (
@@ -254,3 +255,20 @@ def test_project_folder_archive_materialization_discovers_tcr_tables(tmp_path: P
     assert notes
     assert len(sources) == 1
     assert sources[0].name == "filtered_contig_annotations.csv"
+
+
+def test_llm_client_loads_root_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_file = tmp_path / ".scrta_agent.env"
+    env_file.write_text(
+        "SCRTA_AGENT_API_KEY=dummy_key\nSCRTA_AGENT_API_BASE=https://example.invalid/v1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("SCRTA_AGENT_API_KEY", raising=False)
+    monkeypatch.delenv("SCRTA_AGENT_API_BASE", raising=False)
+    monkeypatch.setenv("SCRTA_AGENT_ENV_FILE", str(env_file))
+    monkeypatch.setattr(llm_module, "_LOCAL_ENV_LOADED", False)
+
+    client = LLMClient(use_llm=True)
+
+    assert client.api_key == "dummy_key"
+    assert client.base_url == "https://example.invalid/v1"

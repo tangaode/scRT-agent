@@ -3,6 +3,48 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
+
+
+_LOCAL_ENV_LOADED = False
+
+
+def _load_local_env_files() -> None:
+    """Load local .env-style files without adding a runtime dependency."""
+    global _LOCAL_ENV_LOADED
+    if _LOCAL_ENV_LOADED:
+        return
+    _LOCAL_ENV_LOADED = True
+    candidates: list[Path] = []
+    explicit = os.getenv("SCRTA_AGENT_ENV_FILE")
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    candidates.extend([Path.cwd() / ".env", Path.cwd() / ".scrta_agent.env"])
+    for path in candidates:
+        if not path.exists() or not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            parsed = _parse_env_line(line)
+            if not parsed:
+                continue
+            key, value = parsed
+            os.environ.setdefault(key, value)
+
+
+def _parse_env_line(line: str) -> tuple[str, str] | None:
+    text = line.strip()
+    if not text or text.startswith("#"):
+        return None
+    if text.startswith("export "):
+        text = text[len("export ") :].strip()
+    if "=" not in text:
+        return None
+    key, value = text.split("=", 1)
+    key = key.strip()
+    if not key:
+        return None
+    value = value.strip().strip('"').strip("'")
+    return key, value
 
 
 def _first_value(keys: tuple[str, ...]) -> str | None:
@@ -37,6 +79,7 @@ class LLMClient:
     max_retries: int | None = None
 
     def __post_init__(self) -> None:
+        _load_local_env_files()
         self.api_key = (
             self.api_key
             or _first_value(

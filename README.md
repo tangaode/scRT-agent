@@ -92,6 +92,22 @@ export OPENAI_API_KEY="your_api_key"
 export SCRTA_AGENT_API_KEY="your_api_key"
 ```
 
+For local desktop use, the key can also be placed in a root-level `.env` or
+`.scrta_agent.env` file next to `gui.bat`:
+
+```bash
+OPENAI_API_KEY=your_api_key
+```
+
+For OpenAI-compatible endpoints, the same file can include:
+
+```bash
+SCRTA_AGENT_API_KEY=your_api_key
+SCRTA_AGENT_API_BASE=https://your-compatible-endpoint/v1
+```
+
+Local `.env` files are ignored by Git and should not be committed.
+
 For OpenAI-compatible endpoints:
 
 ```bash
