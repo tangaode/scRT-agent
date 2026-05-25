@@ -527,7 +527,7 @@ class ScRTAgentLauncher(tk.Tk):
         self._set_text(self.hypothesis_sources_text, _list_to_text(raw_candidate.get("required_output_tables")))
 
     def _confirm_hypothesis_review(self) -> None:
-        if not self.hypothesis_selection_holder or not self.hypothesis_selection_event:
+        if self.hypothesis_selection_holder is None or self.hypothesis_selection_event is None:
             messagebox.showinfo("No pending selection", "No hypothesis selection is currently pending.")
             return
         selection = self.hypothesis_list.curselection()
@@ -570,7 +570,7 @@ class ScRTAgentLauncher(tk.Tk):
         self._append_log(f"\nConfirmed selected hypothesis: {hyp_id}\n")
 
     def _cancel_hypothesis_review(self) -> None:
-        if not self.hypothesis_selection_holder or not self.hypothesis_selection_event:
+        if self.hypothesis_selection_holder is None or self.hypothesis_selection_event is None:
             return
         self.hypothesis_selection_holder["error"] = "Hypothesis selection was cancelled."
         self.hypothesis_selection_event.set()
