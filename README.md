@@ -104,8 +104,11 @@ scrta-agent gui
 
 On Windows, double-click `gui.bat` from the repository root after installation
 or run it from a terminal. The desktop launcher provides file browsers,
-configuration save/reload, run status, live logs and a hypothesis
-selection/editing dialog.
+configuration save/reload, run status, live logs and a Hypothesis Review panel.
+When candidate hypotheses are generated, the panel is populated with the
+candidate list and editable fields for the selected hypothesis, explanation,
+required tests, falsification criteria and source tables. The workflow waits
+until the user confirms a hypothesis before continuing to deep-dive analysis.
 
 For the terminal wizard:
 

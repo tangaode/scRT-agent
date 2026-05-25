@@ -56,6 +56,11 @@ class ScRTAgentLauncher(tk.Tk):
         self.status_var = tk.StringVar(value="Ready")
         self.last_run_dir_var = tk.StringVar()
         self.command_preview_var = tk.StringVar()
+        self.hypothesis_status_var = tk.StringVar(value="Waiting for generated candidates")
+        self.hypothesis_title_var = tk.StringVar()
+        self.current_hypothesis_candidates: dict[str, dict[str, object]] = {}
+        self.hypothesis_selection_holder: dict[str, object] | None = None
+        self.hypothesis_selection_event: threading.Event | None = None
 
         self.execute_var = tk.BooleanVar(value=True)
         self.input_prep_llm_var = tk.BooleanVar(value=True)
@@ -81,7 +86,7 @@ class ScRTAgentLauncher(tk.Tk):
         right = ttk.Frame(self, padding=8)
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(1, weight=1)
-        right.rowconfigure(1, weight=1)
+        right.rowconfigure(2, weight=1)
 
         config = ttk.LabelFrame(left, text="Run Configuration", padding=8)
         config.grid(row=0, column=0, sticky="nsew")
@@ -185,8 +190,54 @@ class ScRTAgentLauncher(tk.Tk):
         ttk.Label(status, text="Command preview").grid(row=2, column=0, sticky="w", pady=4)
         ttk.Entry(status, textvariable=self.command_preview_var, state="readonly").grid(row=2, column=1, sticky="ew", pady=4)
 
+        hypothesis = ttk.LabelFrame(right, text="Hypothesis Review", padding=8)
+        hypothesis.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        hypothesis.columnconfigure(1, weight=1)
+        ttk.Label(hypothesis, text="Status").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(hypothesis, textvariable=self.hypothesis_status_var).grid(row=0, column=1, sticky="w", pady=4)
+
+        candidate_frame = ttk.Frame(hypothesis)
+        candidate_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=4)
+        candidate_frame.columnconfigure(0, weight=1)
+        self.hypothesis_list = tk.Listbox(candidate_frame, height=4, exportselection=False)
+        self.hypothesis_list.grid(row=0, column=0, sticky="ew")
+        self.hypothesis_list.bind("<<ListboxSelect>>", self._load_hypothesis_review_candidate)
+        hyp_scroll = ttk.Scrollbar(candidate_frame, orient="vertical", command=self.hypothesis_list.yview)
+        hyp_scroll.grid(row=0, column=1, sticky="ns")
+        self.hypothesis_list.configure(yscrollcommand=hyp_scroll.set)
+
+        ttk.Label(hypothesis, text="Title").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(hypothesis, textvariable=self.hypothesis_title_var).grid(row=2, column=1, sticky="ew", pady=4)
+
+        notebook = ttk.Notebook(hypothesis)
+        notebook.grid(row=3, column=0, columnspan=2, sticky="ew", pady=4)
+        self.hypothesis_statement_text = self._add_text_tab(notebook, "Statement")
+        self.hypothesis_explanation_text = self._add_text_tab(notebook, "Explanation")
+        self.hypothesis_tests_text = self._add_text_tab(notebook, "Required Tests")
+        self.hypothesis_falsify_text = self._add_text_tab(notebook, "Falsification")
+        self.hypothesis_sources_text = self._add_text_tab(notebook, "Source Tables", height=4)
+
+        hypothesis_buttons = ttk.Frame(hypothesis)
+        hypothesis_buttons.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        hypothesis_buttons.columnconfigure(0, weight=1)
+        hypothesis_buttons.columnconfigure(1, weight=1)
+        self.confirm_hypothesis_button = ttk.Button(
+            hypothesis_buttons,
+            text="Use Selected Hypothesis and Continue",
+            command=self._confirm_hypothesis_review,
+            state="disabled",
+        )
+        self.confirm_hypothesis_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.cancel_hypothesis_button = ttk.Button(
+            hypothesis_buttons,
+            text="Cancel Hypothesis Selection",
+            command=self._cancel_hypothesis_review,
+            state="disabled",
+        )
+        self.cancel_hypothesis_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
         log_frame = ttk.LabelFrame(right, text="Execution Log", padding=8)
-        log_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        log_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.log_text = tk.Text(log_frame, wrap="word", height=30)
@@ -209,6 +260,18 @@ class ScRTAgentLauncher(tk.Tk):
         ]
         for variable in variables:
             variable.trace_add("write", lambda *_: self._update_command_preview())
+
+    def _add_text_tab(self, notebook: ttk.Notebook, label: str, height: int = 6) -> tk.Text:
+        frame = ttk.Frame(notebook, padding=4)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        text = tk.Text(frame, height=height, wrap="word")
+        text.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=scroll.set)
+        notebook.add(frame, text=label)
+        return text
 
     def _browse_input(self, target_var: tk.StringVar) -> None:
         paths = filedialog.askopenfilenames(title="Select input files")
@@ -253,10 +316,17 @@ class ScRTAgentLauncher(tk.Tk):
         if not self.rna_var.get().strip() or not self.tcr_var.get().strip():
             messagebox.showerror("Missing inputs", "RNA input(s) and TCR input(s) are required.")
             return
+        if self.interactive_selection_var.get() and (not self.execute_var.get() or not self.deep_dive_var.get()):
+            messagebox.showerror(
+                "Hypothesis review unavailable",
+                "Interactive hypothesis selection requires Execute scripts and Deep-dive loop to be enabled.",
+            )
+            return
         self.stop_requested = False
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.status_var.set("Running")
+        self._reset_hypothesis_review("Waiting for generated candidates")
         self.log_text.delete("1.0", tk.END)
         self._update_command_preview()
         settings = self._collect_settings()
@@ -328,11 +398,9 @@ class ScRTAgentLauncher(tk.Tk):
             self.message_queue.put(("run_error", traceback.format_exc()))
 
     def _request_hypothesis_selection(self, candidates: dict[str, dict[str, object]]) -> DeepDiveSelection:
-        if not self.interactive_selection_var.get():
-            raise RuntimeError("GUI hypothesis selection callback was called while interactive selection is disabled.")
         holder: dict[str, object] = {}
         event = threading.Event()
-        self.message_queue.put(("hypothesis_dialog", candidates, holder, event))
+        self.message_queue.put(("hypothesis_review", candidates, holder, event))
         event.wait()
         error = holder.get("error")
         if error:
@@ -356,6 +424,130 @@ class ScRTAgentLauncher(tk.Tk):
             holder["selection"] = dialog.selection
         event.set()
 
+    def _populate_hypothesis_review(
+        self,
+        candidates: dict[str, dict[str, object]],
+        holder: dict[str, object],
+        event: threading.Event,
+    ) -> None:
+        self.current_hypothesis_candidates = candidates
+        self.hypothesis_selection_holder = holder
+        self.hypothesis_selection_event = event
+        self.hypothesis_list.delete(0, tk.END)
+        for hyp_id, candidate in sorted(candidates.items()):
+            self.hypothesis_list.insert(tk.END, f"{hyp_id}: {candidate.get('title', '')}")
+        self.hypothesis_status_var.set("Select, edit, and confirm one hypothesis")
+        self.confirm_hypothesis_button.configure(state="normal")
+        self.cancel_hypothesis_button.configure(state="normal")
+        if self.hypothesis_list.size():
+            self.hypothesis_list.selection_set(0)
+            self.hypothesis_list.activate(0)
+            self.hypothesis_list.see(0)
+            self._load_hypothesis_review_candidate()
+        self._append_log(
+            "\nHypothesis candidates are ready. Select and edit one in the Hypothesis Review panel, "
+            "then click Use Selected Hypothesis and Continue.\n"
+        )
+
+    def _load_hypothesis_review_candidate(self, event: object | None = None) -> None:
+        selection = self.hypothesis_list.curselection()
+        if not selection:
+            return
+        label = self.hypothesis_list.get(selection[0])
+        hyp_id = label.split(":", 1)[0].strip()
+        candidate = self.current_hypothesis_candidates.get(hyp_id)
+        if not candidate:
+            return
+        raw_candidate = candidate.get("raw") if isinstance(candidate.get("raw"), dict) else {}
+        self.hypothesis_title_var.set(str(candidate.get("title") or hyp_id))
+        self._set_text(self.hypothesis_statement_text, str(candidate.get("hypothesis_statement") or ""))
+        self._set_text(self.hypothesis_explanation_text, str(candidate.get("plain_language_explanation") or ""))
+        self._set_text(self.hypothesis_tests_text, _list_to_text(raw_candidate.get("key_validation")))
+        self._set_text(self.hypothesis_falsify_text, _list_to_text(raw_candidate.get("falsification_criteria")))
+        self._set_text(self.hypothesis_sources_text, _list_to_text(raw_candidate.get("required_output_tables")))
+
+    def _confirm_hypothesis_review(self) -> None:
+        if not self.hypothesis_selection_holder or not self.hypothesis_selection_event:
+            messagebox.showinfo("No pending selection", "No hypothesis selection is currently pending.")
+            return
+        selection = self.hypothesis_list.curselection()
+        if not selection and self.hypothesis_list.size() == 1:
+            self.hypothesis_list.selection_set(0)
+            self.hypothesis_list.activate(0)
+            selection = self.hypothesis_list.curselection()
+        if not selection:
+            messagebox.showerror("No hypothesis selected", "Select a hypothesis before continuing.")
+            return
+        label = self.hypothesis_list.get(selection[0])
+        hyp_id = label.split(":", 1)[0].strip()
+        candidate = self.current_hypothesis_candidates.get(hyp_id)
+        if not candidate:
+            messagebox.showerror("Invalid selection", "The selected hypothesis is no longer available.")
+            return
+        selected = DeepDiveSelection(
+            hypothesis_id=hyp_id,
+            title=self.hypothesis_title_var.get().strip() or hyp_id,
+            selected_hypothesis=self._get_text(self.hypothesis_statement_text),
+            plain_language_explanation=self._get_text(self.hypothesis_explanation_text),
+            rationale="Selected and edited through the GUI hypothesis review panel.",
+            required_tests=_text_to_list(self._get_text(self.hypothesis_tests_text)),
+            falsification_criteria=_text_to_list(self._get_text(self.hypothesis_falsify_text)),
+            source_tables=_text_to_list(self._get_text(self.hypothesis_sources_text))
+            or ["rag_grounded_hypothesis_candidates.md"],
+            selected_candidate_source="gui_hypothesis_review_panel",
+            selected_candidate_text=str(candidate.get("source_text") or "").strip(),
+            selection_mode="gui_review_panel_candidate_selection_for_deep_dive",
+            data_support_level="not_assessed",
+        )
+        self.hypothesis_selection_holder["selection"] = selected
+        self.hypothesis_selection_event.set()
+        self.hypothesis_selection_holder = None
+        self.hypothesis_selection_event = None
+        self.confirm_hypothesis_button.configure(state="disabled")
+        self.cancel_hypothesis_button.configure(state="disabled")
+        self.hypothesis_status_var.set(f"Confirmed {hyp_id}; workflow is continuing")
+        self.status_var.set("Running")
+        self._append_log(f"\nConfirmed selected hypothesis: {hyp_id}\n")
+
+    def _cancel_hypothesis_review(self) -> None:
+        if not self.hypothesis_selection_holder or not self.hypothesis_selection_event:
+            return
+        self.hypothesis_selection_holder["error"] = "Hypothesis selection was cancelled."
+        self.hypothesis_selection_event.set()
+        self.hypothesis_selection_holder = None
+        self.hypothesis_selection_event = None
+        self.confirm_hypothesis_button.configure(state="disabled")
+        self.cancel_hypothesis_button.configure(state="disabled")
+        self.hypothesis_status_var.set("Selection cancelled")
+        self.status_var.set("Stopping")
+
+    def _reset_hypothesis_review(self, status: str) -> None:
+        self.current_hypothesis_candidates = {}
+        self.hypothesis_selection_holder = None
+        self.hypothesis_selection_event = None
+        self.hypothesis_list.delete(0, tk.END)
+        self.hypothesis_title_var.set("")
+        for widget in [
+            self.hypothesis_statement_text,
+            self.hypothesis_explanation_text,
+            self.hypothesis_tests_text,
+            self.hypothesis_falsify_text,
+            self.hypothesis_sources_text,
+        ]:
+            self._set_text(widget, "")
+        self.confirm_hypothesis_button.configure(state="disabled")
+        self.cancel_hypothesis_button.configure(state="disabled")
+        self.hypothesis_status_var.set(status)
+
+    @staticmethod
+    def _set_text(widget: tk.Text, value: str) -> None:
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", value)
+
+    @staticmethod
+    def _get_text(widget: tk.Text) -> str:
+        return widget.get("1.0", tk.END).strip()
+
     def _poll_queue(self) -> None:
         try:
             while True:
@@ -368,6 +560,10 @@ class ScRTAgentLauncher(tk.Tk):
                     self.status_var.set("Waiting for hypothesis selection")
                     self._open_hypothesis_dialog(candidates, holder, event)
                     self.status_var.set("Running")
+                elif kind == "hypothesis_review":
+                    _, candidates, holder, event = message
+                    self.status_var.set("Waiting for hypothesis selection")
+                    self._populate_hypothesis_review(candidates, holder, event)
                 elif kind == "run_complete":
                     self.status_var.set("Finished")
                     self.last_run_dir_var.set(message[1])
