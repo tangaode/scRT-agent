@@ -1,0 +1,1465 @@
+from __future__ import annotations
+
+import csv
+import gzip
+import json
+import math
+import random
+import re
+from collections import Counter, defaultdict
+from pathlib import Path
+
+
+RNA_PATH = Path($rna_path)
+TCR_PATH = Path($tcr_path)
+OUTPUT_DIR = Path($output_dir)
+ANALYSIS_NAME = $analysis_name
+DATASET_RECONNAISSANCE_CONTRACT = $dataset_reconnaissance_contract
+
+
+SIGNATURES = {
+    "cytotoxic": ["GZMB", "PRF1", "NKG7", "GNLY", "GZMA"],
+    "exhaustion": ["PDCD1", "LAG3", "HAVCR2", "TIGIT", "CTLA4", "TOX"],
+    "interferon": ["IFIT1", "ISG15", "MX1", "IFI6", "IFIT3"],
+    "tissue_residency": ["ITGAE", "CXCR6", "ZNF683", "CD69"],
+    "memory_progenitor": ["TCF7", "IL7R", "CCR7", "SELL", "LEF1"],
+    "proliferation": ["MKI67", "TOP2A", "STMN1", "TYMS"],
+    "treg": ["FOXP3", "IL2RA", "CTLA4", "IKZF2", "TIGIT"],
+}
+
+T_CELL_MARKER_PANEL = {
+    "naive_memory_cd4": ["CD3D", "CD3E", "CD4", "CCR7", "IL7R", "SELL", "TCF7"],
+    "cytotoxic_cd8": ["CD3D", "CD3E", "CD8A", "CD8B", "NKG7", "GZMB", "PRF1", "GNLY", "GZMH"],
+    "exhausted_cd8": ["CD8A", "PDCD1", "CXCL13", "TOX", "HAVCR2", "LAG3", "TIGIT", "LAYN"],
+    "treg": ["CD4", "FOXP3", "IL2RA", "CTLA4", "IKZF2", "CCR8", "TIGIT"],
+    "cycling_t": ["MKI67", "TOP2A", "STMN1", "TYMS"],
+    "trm": ["ITGAE", "CXCR6", "ZNF683", "CD69"],
+    "mait_gamma_delta": ["TRAV1-2", "KLRB1", "SLC4A10", "TRDC", "TRGC1", "TRGC2"],
+    "nk_like": ["FGFBP2", "FCGR3A", "KLRD1", "KLRF1", "NKG7", "GNLY"],
+}
+
+CLONE_SIZE_THRESHOLDS = {
+    "Single": 1,
+    "Small": 5,
+    "Medium": 20,
+    "Large": 100,
+    "Hyperexpanded": 500,
+}
+
+
+BARCODE_CANDIDATES = [
+    "barcode",
+    "cell_barcode",
+    "cell",
+    "cell_id",
+    "obs_name",
+]
+
+CLONE_CANDIDATES = [
+    "clonotype_id",
+    "clonotype",
+    "clone_id",
+    "clone",
+    "cdr3",
+    "cdr3_aa",
+]
+
+GROUP_CANDIDATES = [
+    "cell_type",
+    "annotation",
+    "cluster",
+    "leiden",
+    "scrta_timepoint",
+    "scrta_tissue",
+    "scrta_condition",
+    "scrta_sample",
+    "scrta_patient",
+    "sample",
+    "sample_id",
+    "patient",
+    "donor",
+    "tissue",
+    "condition",
+    "response",
+    "timepoint",
+]
+
+
+def open_text(path: Path):
+    if path.name.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return path.open("r", encoding="utf-8", errors="replace")
+
+
+def infer_delimiter(path: Path) -> str:
+    lower = path.name.lower()
+    if lower.endswith(".csv") or lower.endswith(".csv.gz"):
+        return ","
+    return "\t"
+
+
+def normalize_barcode(value: object) -> str:
+    text = str(value).strip()
+    if not text:
+        return ""
+    parts = text.split("-")
+    if len(parts) >= 2 and parts[1].isdigit():
+        return f"{parts[0]}-{parts[1]}"
+    return text
+
+
+def find_column(columns: list[str], candidates: list[str]) -> str | None:
+    lowered = {c.lower(): c for c in columns}
+    for candidate in candidates:
+        if candidate in lowered:
+            return lowered[candidate]
+    for candidate in candidates:
+        for col in columns:
+            if candidate in col.lower():
+                return col
+    return None
+
+
+def build_clone_identity(
+    row: dict[str, str],
+    clone_col: str | None,
+    cdr3_col: str | None,
+    patient_col: str | None,
+    sample_col: str | None,
+) -> str:
+    # In cohorts, labels such as "clonotype1" are often local to a patient or
+    # sample. Scope clone identity to the patient when possible to avoid false
+    # cross-patient clone merging.
+    base = ""
+    if cdr3_col:
+        base = str(row.get(cdr3_col, "")).strip()
+    if not base and clone_col:
+        base = str(row.get(clone_col, "")).strip()
+    if not base:
+        return "unassigned"
+    scope = ""
+    if patient_col:
+        scope = str(row.get(patient_col, "")).strip()
+    if not scope and sample_col:
+        scope = str(row.get(sample_col, "")).strip()
+    return f"{scope}|{base}" if scope else base
+
+
+def barcode_keys(
+    barcode: object,
+    sample: object = "",
+    patient: object = "",
+) -> list[str]:
+    raw = str(barcode).strip()
+    norm = normalize_barcode(raw)
+    sample_text = str(sample).strip()
+    patient_text = str(patient).strip()
+    keys = []
+    for b in (raw, norm):
+        if not b:
+            continue
+        if sample_text:
+            keys.append(f"sample:{sample_text}|{b}")
+        if patient_text:
+            keys.append(f"patient:{patient_text}|{b}")
+    for b in (raw, norm):
+        if b:
+            keys.append(f"barcode:{b}")
+    seen = set()
+    unique = []
+    for key in keys:
+        if key not in seen:
+            unique.append(key)
+            seen.add(key)
+    return unique
+
+
+def read_tcr_rows(path: Path) -> tuple[list[dict[str, str]], list[str]]:
+    sep = infer_delimiter(path)
+    with open_text(path) as fh:
+        reader = csv.DictReader(fh, delimiter=sep)
+        rows = [dict(row) for row in reader]
+        columns = [str(c) for c in (reader.fieldnames or [])]
+    return rows, columns
+
+
+def safe_write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    fieldnames = sorted({key for row in rows for key in row.keys()})
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def summarize_counter(counter: Counter, key_name: str, value_name: str, limit: int = 50):
+    return [
+        {key_name: key, value_name: value}
+        for key, value in counter.most_common(limit)
+    ]
+
+
+def clean_label(value: object) -> str:
+    text = str(value).strip()
+    if text.lower() in {"", "nan", "none", "na", "null"}:
+        return ""
+    return text
+
+
+def first_nonempty(*values: object) -> str:
+    for value in values:
+        text = clean_label(value)
+        if text:
+            return text
+    return ""
+
+
+def clone_size_bin_sc_repertoire(size: object, matched: bool = True) -> str:
+    if not matched:
+        return "Unmatched"
+    try:
+        value = int(float(size))
+    except Exception:
+        value = 0
+    if value <= 0:
+        return "Unmatched"
+    if value == 1:
+        return "Single"
+    if value <= CLONE_SIZE_THRESHOLDS["Small"]:
+        return "Small"
+    if value <= CLONE_SIZE_THRESHOLDS["Medium"]:
+        return "Medium"
+    if value <= CLONE_SIZE_THRESHOLDS["Large"]:
+        return "Large"
+    return "Hyperexpanded"
+
+
+def parse_patient(text: str) -> str:
+    text = clean_label(text)
+    patterns = [
+        r"(?i)\b(patient|pt|donor|subject)[_\-\s]*([A-Za-z0-9]+)\b",
+        r"(?i)\b(P[0-9]+)\b",
+        r"(?i)\b(PT[0-9]+)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(match.lastindex or 1).upper()
+    return ""
+
+
+def parse_timepoint(text: str) -> str:
+    low = clean_label(text).lower()
+    if not low:
+        return ""
+    if re.search(r"\b(pre|baseline|before|pretreatment|pretx|pre_tx)\b", low):
+        return "pre"
+    if re.search(r"\b(post|after|on[-_\s]?treatment|ontx|posttx|post_tx)\b", low):
+        return "post"
+    match = re.search(r"\b(day|d|week|wk|w|month|mo)[-_ ]*([0-9]+)\b", low)
+    if match:
+        return f"{match.group(1)}{match.group(2)}"
+    return ""
+
+
+def parse_tissue(text: str) -> str:
+    low = clean_label(text).lower()
+    if not low:
+        return ""
+    if re.search(r"\b(tumou?r|tumor|lesion|tumour|met|metastasis)\b", low) or re.search(r"(^|[-_])t($|[-_])", low):
+        return "tumor"
+    if re.search(r"\b(pbmc|blood|peripheral|plasma)\b", low) or re.search(r"(^|[-_])p($|[-_])", low):
+        return "blood"
+    if re.search(r"\b(normal|adjacent|healthy)\b", low) or re.search(r"(^|[-_])n($|[-_])", low):
+        return "normal"
+    if re.search(r"\b(ln|lymph|node)\b", low):
+        return "lymph_node"
+    return ""
+
+
+def parse_sample_metadata(adata) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    obs = adata.obs
+    obs_columns = [str(c) for c in obs.columns]
+    patient_col = find_column(obs_columns, ["patient", "donor", "subject"])
+    sample_col = find_column(obs_columns, ["sample", "sample_id", "orig.ident", "library"])
+    time_col = find_column(obs_columns, ["timepoint", "time_point", "visit", "treatment_time"])
+    tissue_col = find_column(obs_columns, ["tissue", "site", "compartment", "source"])
+    condition_col = find_column(obs_columns, ["condition", "response", "group", "disease", "treatment"])
+
+    rows = []
+    parsed_patient = []
+    parsed_sample = []
+    parsed_time = []
+    parsed_tissue = []
+    parsed_condition = []
+
+    for idx, cell in enumerate(adata.obs_names):
+        record = obs.iloc[idx]
+        sample = first_nonempty(record.get(sample_col, "") if sample_col else "", cell)
+        patient = first_nonempty(record.get(patient_col, "") if patient_col else "", parse_patient(sample), parse_patient(cell))
+        timepoint = first_nonempty(record.get(time_col, "") if time_col else "", parse_timepoint(sample), parse_timepoint(cell))
+        tissue = first_nonempty(record.get(tissue_col, "") if tissue_col else "", parse_tissue(sample), parse_tissue(cell))
+        condition = first_nonempty(record.get(condition_col, "") if condition_col else "")
+        parsed_patient.append(patient)
+        parsed_sample.append(sample)
+        parsed_time.append(timepoint)
+        parsed_tissue.append(tissue)
+        parsed_condition.append(condition)
+        rows.append(
+            {
+                "cell": str(cell),
+                "scrta_patient": patient,
+                "scrta_sample": sample,
+                "scrta_timepoint": timepoint,
+                "scrta_tissue": tissue,
+                "scrta_condition": condition,
+            }
+        )
+
+    adata.obs["scrta_patient"] = parsed_patient
+    adata.obs["scrta_sample"] = parsed_sample
+    adata.obs["scrta_timepoint"] = parsed_time
+    adata.obs["scrta_tissue"] = parsed_tissue
+    adata.obs["scrta_condition"] = parsed_condition
+
+    summary_rows = []
+    for col in ["scrta_patient", "scrta_sample", "scrta_timepoint", "scrta_tissue", "scrta_condition"]:
+        values = [clean_label(x) or "unparsed" for x in adata.obs[col].tolist()]
+        counter = Counter(values)
+        for value, count in counter.most_common(80):
+            summary_rows.append(
+                {
+                    "parsed_column": col,
+                    "value": value,
+                    "cells": int(count),
+                    "fraction": float(count / max(adata.n_obs, 1)),
+                    "source_columns": ",".join(
+                        [x for x in [patient_col, sample_col, time_col, tissue_col, condition_col] if x]
+                    ),
+                }
+            )
+    return rows, summary_rows
+
+
+def load_adata():
+    try:
+        import anndata as ad
+    except Exception as exc:
+        raise RuntimeError(
+            "anndata is required to read h5ad files. Install with: "
+            "pip install -e \".[analysis]\""
+        ) from exc
+    return ad.read_h5ad(RNA_PATH)
+
+
+def add_tcr_to_obs(adata, tcr_rows: list[dict[str, str]], tcr_columns: list[str]) -> dict[str, object]:
+    barcode_col = find_column(tcr_columns, BARCODE_CANDIDATES)
+    clone_col = find_column(tcr_columns, CLONE_CANDIDATES)
+    cdr3_col = find_column(tcr_columns, ["cdr3", "cdr3_aa"])
+    v_gene_col = find_column(tcr_columns, ["v_gene", "v_call", "v", "trav", "trbv"])
+    j_gene_col = find_column(tcr_columns, ["j_gene", "j_call", "j", "traj", "trbj"])
+    patient_col = find_column(tcr_columns, ["patient", "donor", "subject"])
+    sample_col = find_column(tcr_columns, ["sample", "sample_id"])
+    rna_columns = [str(c) for c in adata.obs.columns]
+    rna_patient_col = find_column(rna_columns, ["patient", "donor", "subject"])
+    rna_sample_col = find_column(rna_columns, ["sample", "sample_id"])
+    if not barcode_col:
+        return {
+            "barcode_column": None,
+            "clone_column": clone_col,
+            "cdr3_column": cdr3_col,
+            "v_gene_column": v_gene_col,
+            "j_gene_column": j_gene_col,
+            "clone_scope_column": patient_col or sample_col,
+            "matched_cells": 0,
+            "matched_fraction": 0.0,
+            "warning": "No barcode-like TCR column found.",
+        }
+
+    by_barcode: dict[str, dict[str, str]] = {}
+    for row in tcr_rows:
+        raw = str(row.get(barcode_col, "")).strip()
+        if raw:
+            for key in barcode_keys(
+                raw,
+                row.get(sample_col, "") if sample_col else "",
+                row.get(patient_col, "") if patient_col else "",
+            ):
+                by_barcode.setdefault(key, row)
+
+    matched = []
+    clone_ids = []
+    cdr3_values = []
+    v_gene_values = []
+    j_gene_values = []
+    match_key_types = Counter()
+    for idx, cell in enumerate(adata.obs_names):
+        obs_row = adata.obs.iloc[idx]
+        sample_value = obs_row.get(rna_sample_col, "") if rna_sample_col else ""
+        patient_value = obs_row.get(rna_patient_col, "") if rna_patient_col else ""
+        row = None
+        matched_key = ""
+        for key in barcode_keys(cell, sample_value, patient_value):
+            if key in by_barcode:
+                row = by_barcode[key]
+                matched_key = key.split(":", 1)[0]
+                break
+        matched.append(row is not None)
+        if matched_key:
+            match_key_types[matched_key] += 1
+        if row:
+            clone_ids.append(
+                build_clone_identity(row, clone_col, cdr3_col, patient_col, sample_col)
+            )
+            cdr3_values.append(str(row.get(cdr3_col, "")).strip() if cdr3_col else "")
+            v_gene_values.append(str(row.get(v_gene_col, "")).strip() if v_gene_col else "")
+            j_gene_values.append(str(row.get(j_gene_col, "")).strip() if j_gene_col else "")
+        else:
+            clone_ids.append("unassigned")
+            cdr3_values.append("")
+            v_gene_values.append("")
+            j_gene_values.append("")
+
+    adata.obs["scrta_tcr_matched"] = matched
+    adata.obs["scrta_clone_id"] = clone_ids
+    if cdr3_col:
+        adata.obs["scrta_cdr3"] = cdr3_values
+    if v_gene_col:
+        adata.obs["scrta_v_gene"] = v_gene_values
+    if j_gene_col:
+        adata.obs["scrta_j_gene"] = j_gene_values
+    clone_sizes = Counter(x for x in clone_ids if x and x != "unassigned")
+    adata.obs["scrta_clone_size"] = [clone_sizes.get(x, 0) for x in clone_ids]
+    adata.obs["scrta_clone_size_bin"] = [
+        clone_size_bin_sc_repertoire(size, bool(m))
+        for m, size in zip(matched, adata.obs["scrta_clone_size"])
+    ]
+
+    return {
+        "barcode_column": barcode_col,
+        "clone_column": clone_col,
+        "cdr3_column": cdr3_col,
+        "v_gene_column": v_gene_col,
+        "j_gene_column": j_gene_col,
+        "clone_scope_column": patient_col or sample_col,
+        "clone_identity_rule": "scope(patient_or_sample)|cdr3_else_clonotype",
+        "rna_sample_column": rna_sample_col,
+        "rna_patient_column": rna_patient_col,
+        "match_key_types": dict(match_key_types),
+        "matched_cells": int(sum(matched)),
+        "matched_fraction": float(sum(matched) / max(adata.n_obs, 1)),
+        "unique_clones": int(len(clone_sizes)),
+        "clone_size_bin_rule": "scRepertoire-like thresholds: Single=1, Small=2-5, Medium=6-20, Large=21-100, Hyperexpanded>100; threshold reference includes Hyperexpanded=500",
+    }
+
+
+def ensure_basic_embedding(adata) -> list[str]:
+    messages = []
+    try:
+        import scanpy as sc
+        import numpy as np
+    except Exception:
+        return ["scanpy not installed; skipped normalization, clustering, and UMAP."]
+
+    umap_cols = None
+    for x_col, y_col in [("UMAP1", "UMAP2"), ("umap_1", "umap_2"), ("X_umap1", "X_umap2")]:
+        if x_col in adata.obs and y_col in adata.obs:
+            umap_cols = (x_col, y_col)
+            break
+    if "X_umap" not in adata.obsm and umap_cols:
+        try:
+            adata.obsm["X_umap"] = adata.obs[list(umap_cols)].astype(float).to_numpy()
+            messages.append(f"Loaded existing UMAP coordinates from obs columns {umap_cols[0]}/{umap_cols[1]}.")
+        except Exception as exc:
+            messages.append(f"Existing UMAP columns were present but could not be loaded: {exc}")
+
+    if "X_umap" in adata.obsm and "leiden" in adata.obs:
+        messages.append("Existing UMAP and leiden found; skipped recomputation.")
+        return messages
+
+    try:
+        adata_tmp = adata.copy()
+        sc.pp.normalize_total(adata_tmp, target_sum=1e4)
+        sc.pp.log1p(adata_tmp)
+        sc.pp.highly_variable_genes(adata_tmp, n_top_genes=min(2000, adata_tmp.n_vars))
+        sc.pp.pca(adata_tmp, svd_solver="arpack")
+        n_pcs = min(30, max(2, adata_tmp.obsm["X_pca"].shape[1]))
+        sc.pp.neighbors(adata_tmp, n_neighbors=15, n_pcs=n_pcs)
+        sc.tl.umap(adata_tmp)
+        try:
+            sc.tl.leiden(adata_tmp, resolution=0.8)
+            cluster_col = "leiden"
+        except Exception:
+            sc.tl.louvain(adata_tmp, resolution=0.8)
+            cluster_col = "louvain"
+        adata.obsm["X_umap"] = adata_tmp.obsm["X_umap"]
+        adata.obs["leiden"] = adata_tmp.obs[cluster_col].astype(str).values
+        messages.append(
+            "Computed 10x-like GEX workflow: normalize_total/log1p/HVG/PCA/kNN graph/UMAP/graph clustering."
+        )
+    except Exception as exc:
+        messages.append(f"scanpy embedding failed: {exc}")
+    return messages
+
+
+def score_signatures(adata) -> list[dict[str, object]]:
+    try:
+        import scanpy as sc
+    except Exception:
+        return [{"signature": name, "status": "scanpy not installed"} for name in SIGNATURES]
+
+    records = []
+    var_names = {str(x).upper(): str(x) for x in adata.var_names}
+    for name, genes in SIGNATURES.items():
+        present = [var_names[g] for g in genes if g in var_names]
+        if len(present) < 2:
+            records.append(
+                {
+                    "signature": name,
+                    "status": "skipped",
+                    "present_genes": ",".join(present),
+                }
+            )
+            continue
+        score_col = f"scrta_score_{name}"
+        try:
+            sc.tl.score_genes(adata, gene_list=present, score_name=score_col)
+            values = adata.obs[score_col]
+            records.append(
+                {
+                    "signature": name,
+                    "status": "scored",
+                    "present_genes": ",".join(present),
+                    "mean": float(values.mean()),
+                    "min": float(values.min()),
+                    "max": float(values.max()),
+                }
+            )
+        except Exception as exc:
+            records.append({"signature": name, "status": f"failed: {exc}"})
+    return records
+
+
+def choose_state_columns(obs_columns: list[str]) -> list[str]:
+    picked = []
+    for candidate in GROUP_CANDIDATES:
+        col = find_column(obs_columns, [candidate])
+        if col and col not in picked:
+            picked.append(col)
+    return picked[:12]
+
+
+def summarize_clone_state(adata, state_columns: list[str]) -> list[dict[str, object]]:
+    rows = []
+    obs = adata.obs
+    for col in state_columns:
+        if col not in obs:
+            continue
+        grouped: dict[tuple[str, str], dict[str, object]] = defaultdict(
+            lambda: {
+                "cells": 0,
+                "tcr_matched": 0,
+                "expanded_cells": 0,
+                "unique_clones": set(),
+            }
+        )
+        for _, record in obs[[col, "scrta_tcr_matched", "scrta_clone_id", "scrta_clone_size"]].iterrows():
+            state = str(record[col])
+            clone_bin = "expanded" if int(record["scrta_clone_size"]) > 1 else "single_or_unmatched"
+            key = (col, state)
+            grouped[key]["cells"] += 1
+            grouped[key]["tcr_matched"] += int(bool(record["scrta_tcr_matched"]))
+            grouped[key]["expanded_cells"] += int(clone_bin == "expanded")
+            clone_id = str(record["scrta_clone_id"])
+            if clone_id and clone_id != "unassigned":
+                grouped[key]["unique_clones"].add(clone_id)
+        for (column, state), values in grouped.items():
+            cells = int(values["cells"])
+            rows.append(
+                {
+                    "grouping_column": column,
+                    "group": state,
+                    "cells": cells,
+                    "tcr_matched": int(values["tcr_matched"]),
+                    "matched_fraction": values["tcr_matched"] / max(cells, 1),
+                    "expanded_cells": int(values["expanded_cells"]),
+                    "expanded_fraction": values["expanded_cells"] / max(cells, 1),
+                    "unique_clones": len(values["unique_clones"]),
+                }
+            )
+    return rows
+
+
+def binomial_two_sided_p(k: int, n: int) -> float:
+    if n <= 0:
+        return 1.0
+    observed = min(k, n - k)
+    prob = 0.0
+    for i in range(0, observed + 1):
+        prob += math.comb(n, i) * (0.5 ** n)
+    return float(min(1.0, 2.0 * prob))
+
+
+def median(values: list[float]) -> float:
+    clean = sorted(float(x) for x in values if x == x)
+    if not clean:
+        return float("nan")
+    mid = len(clean) // 2
+    if len(clean) % 2:
+        return clean[mid]
+    return (clean[mid - 1] + clean[mid]) / 2.0
+
+
+def patient_blocked_stats(adata, state_columns: list[str]) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    obs = adata.obs.copy()
+    if "scrta_patient" not in obs:
+        return [], [{"status": "skipped", "reason": "scrta_patient missing"}]
+
+    contrast_cols = [c for c in ["scrta_timepoint", "scrta_tissue", "scrta_condition"] if c in obs and obs[c].astype(str).str.len().sum() > 0]
+    score_cols = [c for c in obs.columns if str(c).startswith("scrta_score_")]
+    summary_rows = []
+    test_rows = []
+
+    for contrast in contrast_cols:
+        values = [v for v in sorted(set(clean_label(x) for x in obs[contrast].tolist())) if v]
+        if len(values) < 2:
+            continue
+        for patient, patient_df in obs.groupby("scrta_patient", dropna=False):
+            patient = clean_label(patient) or "unparsed"
+            for group, group_df in patient_df.groupby(contrast, dropna=False):
+                group = clean_label(group) or "unparsed"
+                if group == "unparsed":
+                    continue
+                row = {
+                    "contrast": contrast,
+                    "patient": patient,
+                    "group": group,
+                    "cells": int(len(group_df)),
+                    "expanded_fraction": float((group_df["scrta_clone_size"].astype(int) > 1).mean()) if len(group_df) else 0.0,
+                    "matched_fraction": float(group_df["scrta_tcr_matched"].astype(bool).mean()) if len(group_df) else 0.0,
+                }
+                for score in score_cols:
+                    row[f"mean_{score}"] = float(group_df[score].mean())
+                summary_rows.append(row)
+
+        first, second = values[0], values[1]
+        paired = []
+        for patient, patient_df in obs.groupby("scrta_patient", dropna=False):
+            a = patient_df[patient_df[contrast].astype(str) == first]
+            b = patient_df[patient_df[contrast].astype(str) == second]
+            if len(a) == 0 or len(b) == 0:
+                continue
+            paired.append(
+                {
+                    "patient": clean_label(patient) or "unparsed",
+                    "expanded_diff": float((b["scrta_clone_size"].astype(int) > 1).mean() - (a["scrta_clone_size"].astype(int) > 1).mean()),
+                    **{
+                        f"{score}_diff": float(b[score].mean() - a[score].mean())
+                        for score in score_cols
+                    },
+                }
+            )
+        for metric in ["expanded_diff", *[f"{score}_diff" for score in score_cols]]:
+            diffs = [float(row[metric]) for row in paired if metric in row and float(row[metric]) == float(row[metric])]
+            nonzero = [x for x in diffs if abs(x) > 1e-12]
+            positive = sum(1 for x in nonzero if x > 0)
+            test_rows.append(
+                {
+                    "contrast": contrast,
+                    "group_a": first,
+                    "group_b": second,
+                    "metric": metric,
+                    "paired_patients": len(nonzero),
+                    "median_diff_b_minus_a": median(nonzero),
+                    "positive_diffs": positive,
+                    "sign_test_p_two_sided": binomial_two_sided_p(positive, len(nonzero)),
+                    "status": "tested" if nonzero else "insufficient paired patients",
+                }
+            )
+    if not summary_rows:
+        test_rows.append({"status": "skipped", "reason": "no parseable contrast columns with at least two levels"})
+    return summary_rows, test_rows
+
+
+def clone_size_aware_null_tests(adata, state_columns: list[str], n_perm: int = 50) -> list[dict[str, object]]:
+    obs = adata.obs.copy()
+    rows = []
+    if "scrta_clone_size" not in obs or "scrta_patient" not in obs:
+        return [{"status": "skipped", "reason": "clone size or patient labels missing"}]
+
+    rng = random.Random(13)
+    candidate_cols = [c for c in state_columns if c in obs]
+    candidate_cols.extend([c for c in ["scrta_timepoint", "scrta_tissue", "scrta_condition"] if c in obs and c not in candidate_cols])
+    expanded_by_pos = [(int(x) > 1) for x in obs["scrta_clone_size"].tolist()]
+    if len(obs) > 50000:
+        n_perm = min(n_perm, 8)
+        max_groups_per_col = 6
+    else:
+        max_groups_per_col = 12
+    patient_positions: dict[str, list[int]] = defaultdict(list)
+    for pos, patient in enumerate(obs["scrta_patient"].astype(str).tolist()):
+        patient_positions[clean_label(patient) or "unparsed"].append(pos)
+    for col in candidate_cols:
+        col_values = [clean_label(x) for x in obs[col].tolist()]
+        values = [v for v, n in Counter(col_values).most_common(max_groups_per_col) if v and n >= 20]
+        for value in values:
+            labels = [x == value for x in col_values]
+            selected_positions = [pos for pos, flag in enumerate(labels) if flag]
+            cells = len(selected_positions)
+            if cells < 20:
+                continue
+            observed = float(sum(1 for pos in selected_positions if expanded_by_pos[pos]) / max(cells, 1))
+            null_values = []
+            strata = []
+            # Keep clone sizes fixed on cells and shuffle the state/group label
+            # within each patient. This asks whether a state/group captures more
+            # expanded-clone cells than expected from patient-specific clone-size
+            # structure alone.
+            for positions in patient_positions.values():
+                group_labels = [labels[pos] for pos in positions]
+                if any(group_labels) and not all(group_labels):
+                    strata.append((positions, group_labels))
+            if not strata:
+                rows.append(
+                    {
+                        "grouping_column": col,
+                        "group": value,
+                        "cells": cells,
+                        "observed_expanded_fraction": observed,
+                        "status": "skipped",
+                        "reason": "no mixed patient strata for permutation",
+                        "null_model": "shuffle group labels within patient while keeping clone sizes fixed",
+                    }
+                )
+                continue
+            for _ in range(n_perm):
+                perm_labels = list(labels)
+                for positions, group_labels in strata:
+                    shuffled = list(group_labels)
+                    rng.shuffle(shuffled)
+                    for pos, flag in zip(positions, shuffled):
+                        perm_labels[pos] = bool(flag)
+                selected = [pos for pos, flag in enumerate(perm_labels) if flag]
+                if selected:
+                    null_values.append(float(sum(1 for pos in selected if expanded_by_pos[pos]) / len(selected)))
+            if null_values:
+                ge = sum(1 for x in null_values if x >= observed)
+                le = sum(1 for x in null_values if x <= observed)
+                p_two = min(1.0, 2.0 * min(ge, le) / len(null_values))
+                rows.append(
+                    {
+                        "grouping_column": col,
+                        "group": value,
+                        "cells": cells,
+                        "observed_expanded_fraction": observed,
+                        "null_mean": float(sum(null_values) / len(null_values)),
+                        "null_median": median(null_values),
+                        "permutations": len(null_values),
+                        "empirical_p_two_sided": p_two,
+                        "status": "tested",
+                        "null_model": "shuffle group labels within patient while keeping clone sizes fixed",
+                    }
+                )
+    return rows or [{"status": "skipped", "reason": "no eligible groups"}]
+
+
+def infer_t_state_label(row, state_columns: list[str]) -> str:
+    blob = " ".join(clean_label(row.get(col, "")) for col in state_columns if col in row).lower()
+    if "treg" in blob or "regulatory" in blob or "foxp3" in blob:
+        return "Treg"
+    if "cd8" in blob:
+        return "CD8"
+    if "cd4" in blob:
+        return "CD4"
+    return ""
+
+
+def infer_cd8_treg_states(adata, state_columns: list[str]) -> list[str]:
+    labels = []
+    obs = adata.obs
+    var_names = {str(x).upper(): str(x) for x in adata.var_names}
+    marker_genes = {g: var_names[g] for g in ["CD8A", "CD8B", "FOXP3", "IL2RA"] if g in var_names}
+    marker_values = {}
+    if marker_genes:
+        try:
+            import numpy as np
+            X = adata[:, list(marker_genes.values())].X
+            if hasattr(X, "toarray"):
+                X = X.toarray()
+            marker_values = {
+                gene: np.asarray(X[:, i]).reshape(-1)
+                for i, gene in enumerate(marker_genes.keys())
+            }
+        except Exception:
+            marker_values = {}
+
+    for i, (_, row) in enumerate(obs.iterrows()):
+        label = infer_t_state_label(row, state_columns)
+        if label not in {"CD8", "Treg"} and marker_values:
+            cd8 = float(marker_values["CD8A"][i]) if "CD8A" in marker_values else 0.0
+            cd8 += float(marker_values["CD8B"][i]) if "CD8B" in marker_values else 0.0
+            treg = float(marker_values["FOXP3"][i]) if "FOXP3" in marker_values else 0.0
+            treg += float(marker_values["IL2RA"][i]) if "IL2RA" in marker_values else 0.0
+            if treg > 0 and treg >= cd8:
+                label = "Treg_marker_inferred"
+            elif cd8 > 0:
+                label = "CD8_marker_inferred"
+        labels.append(label or "other")
+    adata.obs["scrta_t_state"] = labels
+    return labels
+
+
+def matrix_mean_by_mask(adata, mask, gene_indices: list[int]):
+    try:
+        import numpy as np
+    except Exception:
+        return []
+    if not gene_indices or sum(mask) == 0:
+        return []
+    X = adata.X[mask, :][:, gene_indices]
+    means = np.asarray(X.mean(axis=0)).reshape(-1)
+    return [float(x) for x in means]
+
+
+def within_state_cd8_treg_analysis(adata, state_columns: list[str]) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    infer_cd8_treg_states(adata, state_columns)
+    obs = adata.obs
+    score_cols = [c for c in obs.columns if str(c).startswith("scrta_score_")]
+    contrast_cols = [c for c in ["scrta_tissue", "scrta_timepoint", "scrta_condition", "scrta_clone_size_bin"] if c in obs]
+    signature_rows = []
+    de_rows = []
+
+    for t_state in ["CD8", "CD8_marker_inferred", "Treg", "Treg_marker_inferred"]:
+        state_mask = obs["scrta_t_state"].astype(str) == t_state
+        if int(state_mask.sum()) < 30:
+            continue
+        for contrast in contrast_cols:
+            groups = [g for g, n in Counter(clean_label(x) for x in obs.loc[state_mask, contrast].tolist()).most_common(6) if g and n >= 10]
+            for group in groups:
+                group_mask = state_mask & (obs[contrast].astype(str) == group)
+                row = {
+                    "t_state": t_state,
+                    "contrast": contrast,
+                    "group": group,
+                    "cells": int(group_mask.sum()),
+                    "expanded_fraction": float((obs.loc[group_mask, "scrta_clone_size"].astype(int) > 1).mean()) if int(group_mask.sum()) else 0.0,
+                }
+                for score in score_cols:
+                    row[f"mean_{score}"] = float(obs.loc[group_mask, score].mean())
+                signature_rows.append(row)
+
+            if len(groups) >= 2:
+                group_a, group_b = groups[0], groups[1]
+                mask_a = (state_mask & (obs[contrast].astype(str) == group_a)).to_numpy()
+                mask_b = (state_mask & (obs[contrast].astype(str) == group_b)).to_numpy()
+                if int(mask_a.sum()) >= 10 and int(mask_b.sum()) >= 10:
+                    gene_indices = list(range(min(adata.n_vars, 2000)))
+                    mean_a = matrix_mean_by_mask(adata, mask_a, gene_indices)
+                    mean_b = matrix_mean_by_mask(adata, mask_b, gene_indices)
+                    diffs = []
+                    for local_idx, (a, b) in enumerate(zip(mean_a, mean_b)):
+                        gene = str(adata.var_names[gene_indices[local_idx]])
+                        diffs.append((abs(b - a), b - a, gene, a, b))
+                    for abs_diff, diff, gene, a, b in sorted(diffs, reverse=True)[:40]:
+                        de_rows.append(
+                            {
+                                "t_state": t_state,
+                                "contrast": contrast,
+                                "group_a": group_a,
+                                "group_b": group_b,
+                                "gene": gene,
+                                "mean_a": a,
+                                "mean_b": b,
+                                "mean_diff_b_minus_a": diff,
+                                "abs_mean_diff": abs_diff,
+                                "method": "mean_difference_screen_top_2000_genes",
+                            }
+                        )
+    return (
+        signature_rows or [{"status": "skipped", "reason": "no CD8/Treg-like cells or eligible contrasts"}],
+        de_rows or [{"status": "skipped", "reason": "no eligible within-state two-group contrasts"}],
+    )
+
+
+def clone_sharing_matrix(adata) -> list[dict[str, object]]:
+    obs = adata.obs
+    group_col = "scrta_sample" if "scrta_sample" in obs else None
+    if not group_col:
+        return [{"status": "skipped", "reason": "sample labels missing"}]
+    groups = [g for g, n in Counter(clean_label(x) for x in obs[group_col].tolist()).most_common(30) if g]
+    clone_sets = {}
+    for group in groups:
+        mask = obs[group_col].astype(str) == group
+        clone_sets[group] = set(
+            x for x in obs.loc[mask, "scrta_clone_id"].astype(str).tolist()
+            if x and x != "unassigned"
+        )
+    rows = []
+    for a in groups:
+        for b in groups:
+            inter = len(clone_sets[a] & clone_sets[b])
+            union = len(clone_sets[a] | clone_sets[b])
+            rows.append(
+                {
+                    "grouping_column": group_col,
+                    "group_a": a,
+                    "group_b": b,
+                    "shared_clones": inter,
+                    "clones_a": len(clone_sets[a]),
+                    "clones_b": len(clone_sets[b]),
+                    "jaccard": float(inter / union) if union else 0.0,
+                }
+            )
+    return rows
+
+
+def t_cell_mask_from_metadata(adata, state_columns: list[str]):
+    obs = adata.obs
+    text_cols = [
+        col
+        for col in [
+            "cell_type",
+            "major_cell_type",
+            "sub_cell_type",
+            "annotation",
+            "cluster",
+            "sub_cluster",
+            "leiden",
+            "scrta_t_state",
+            *state_columns,
+        ]
+        if col in obs
+    ]
+    labels = []
+    for _, row in obs[text_cols].iterrows() if text_cols else []:
+        text = " ".join(clean_label(row.get(col, "")) for col in text_cols).lower()
+        is_t = bool(
+            re.search(r"\b(cd4|cd8|treg|t[-_ ]?cell|t cell|mait|gd[t]?|gamma|delta|trdv|trgv)\b", text)
+            or "cd4t" in text
+            or "cd8t" in text
+            or "t_gdt" in text
+            or "t/nk" in text
+        )
+        is_non_t = bool(re.search(r"\b(b cell|bcell|myeloid|mono|macrophage|epithelial|tumou?r|endothelial|fibroblast)\b", text))
+        is_pure_nk = ("nk" in text) and not any(token in text for token in ["cd4", "cd8", "t/nk", "t cell", "tcell", "mait", "trdv"])
+        labels.append(bool(is_t and not is_non_t and not is_pure_nk))
+    if not labels:
+        labels = [False] * adata.n_obs
+
+    if sum(labels) == 0:
+        try:
+            import numpy as np
+            var_names = {str(x).upper(): str(x) for x in adata.var_names}
+            present = [var_names[g] for g in ["CD3D", "CD3E", "TRAC", "CD4", "CD8A", "CD8B"] if g in var_names]
+            if present:
+                X = adata[:, present].X
+                if hasattr(X, "toarray"):
+                    X = X.toarray()
+                values = np.asarray(X).sum(axis=1).reshape(-1)
+                labels = [bool(x > 0) for x in values]
+        except Exception:
+            pass
+    return labels
+
+
+def score_marker_programs_for_subset(adata_subset, cluster_col: str) -> list[dict[str, object]]:
+    try:
+        import numpy as np
+    except Exception:
+        return [{"status": "skipped", "reason": "numpy unavailable"}]
+    var_names = {str(x).upper(): str(x) for x in adata_subset.var_names}
+    rows = []
+    clusters = [c for c, n in Counter(adata_subset.obs[cluster_col].astype(str).tolist()).most_common()]
+    for cluster in clusters:
+        mask = (adata_subset.obs[cluster_col].astype(str) == cluster).to_numpy()
+        cluster_obs = adata_subset.obs.loc[mask]
+        known_cols = [c for c in ["sub_cell_type", "cell_type", "scrta_t_state", "cluster"] if c in cluster_obs]
+        known_labels = []
+        for col in known_cols[:3]:
+            top = Counter(clean_label(x) for x in cluster_obs[col].tolist()).most_common(3)
+            known_labels.extend([f"{col}:{label}({count})" for label, count in top if label])
+        for program, genes in T_CELL_MARKER_PANEL.items():
+            present = [var_names[g] for g in genes if g in var_names]
+            if present and int(mask.sum()) > 0:
+                X = adata_subset[:, present].X[mask, :]
+                if hasattr(X, "toarray"):
+                    X = X.toarray()
+                mean_score = float(np.asarray(X).mean())
+            else:
+                mean_score = float("nan")
+            rows.append(
+                {
+                    "t_cell_cluster": cluster,
+                    "cells": int(mask.sum()),
+                    "marker_program": program,
+                    "genes_requested": ";".join(genes),
+                    "genes_present": ";".join(present),
+                    "mean_expression": mean_score,
+                    "top_existing_annotations": "; ".join(known_labels[:8]),
+                    "expanded_fraction": float((cluster_obs["scrta_clone_size"].astype(int) > 1).mean()) if "scrta_clone_size" in cluster_obs and len(cluster_obs) else 0.0,
+                }
+            )
+    return rows or [{"status": "skipped", "reason": "no T cell clusters available"}]
+
+
+def build_t_cell_cluster_summary(adata_subset, cluster_col: str) -> list[dict[str, object]]:
+    rows = []
+    obs = adata_subset.obs
+    for cluster, group in obs.groupby(cluster_col, dropna=False):
+        clone_ids = [
+            str(x)
+            for x in group.get("scrta_clone_id", []).tolist()
+            if str(x) and str(x) != "unassigned"
+        ]
+        top_ann = {}
+        for col in ["sub_cell_type", "cell_type", "scrta_t_state", "cluster"]:
+            if col in group:
+                top_ann[col] = ";".join(f"{k}:{v}" for k, v in Counter(clean_label(x) for x in group[col].tolist()).most_common(5) if k)
+        rows.append(
+            {
+                "t_cell_cluster": str(cluster),
+                "cells": int(len(group)),
+                "tcr_matched_fraction": float(group["scrta_tcr_matched"].astype(bool).mean()) if "scrta_tcr_matched" in group and len(group) else 0.0,
+                "expanded_fraction": float((group["scrta_clone_size"].astype(int) > 1).mean()) if "scrta_clone_size" in group and len(group) else 0.0,
+                "unique_clonotypes": int(len(set(clone_ids))),
+                "top_existing_annotations": json.dumps(top_ann, ensure_ascii=False),
+            }
+        )
+    return rows or [{"status": "skipped", "reason": "no T cell clusters available"}]
+
+
+def build_occupied_clonotypes_by_group(adata_subset, cluster_col: str) -> list[dict[str, object]]:
+    obs = adata_subset.obs.copy()
+    if "scrta_clone_id" not in obs or "scrta_clone_size_bin" not in obs:
+        return [{"status": "skipped", "reason": "clone columns unavailable"}]
+    group_cols = [
+        col
+        for col in [
+            "scrta_condition",
+            "scrta_tissue",
+            "scrta_timepoint",
+            "scrta_sample",
+            "scrta_patient",
+            cluster_col,
+            "sub_cell_type",
+            "cell_type",
+        ]
+        if col in obs
+    ]
+    rows = []
+    valid = obs[obs["scrta_clone_id"].astype(str).ne("unassigned")].copy()
+    valid = valid[valid["scrta_clone_id"].astype(str).str.len() > 0]
+    for group_col in group_cols:
+        for group, group_df in valid.groupby(group_col, dropna=False):
+            clone_bins: dict[str, set[str]] = defaultdict(set)
+            clone_cells: Counter = Counter()
+            for _, record in group_df[["scrta_clone_id", "scrta_clone_size_bin"]].iterrows():
+                clone_id = str(record["scrta_clone_id"])
+                clone_bins[str(record["scrta_clone_size_bin"])].add(clone_id)
+                clone_cells[str(record["scrta_clone_size_bin"])] += 1
+            total_clones = len(set(group_df["scrta_clone_id"].astype(str).tolist()))
+            for clone_bin in ["Single", "Small", "Medium", "Large", "Hyperexpanded", "Unmatched"]:
+                occupied = len(clone_bins.get(clone_bin, set()))
+                if occupied == 0 and clone_cells.get(clone_bin, 0) == 0:
+                    continue
+                rows.append(
+                    {
+                        "grouping_column": group_col,
+                        "group": clean_label(group) or "unparsed",
+                        "clone_size_bin": clone_bin,
+                        "occupied_clonotypes": occupied,
+                        "cells_in_bin": int(clone_cells.get(clone_bin, 0)),
+                        "total_occupied_clonotypes_in_group": total_clones,
+                        "fraction_occupied_clonotypes": float(occupied / max(total_clones, 1)),
+                        "method": "occupiedscRepertoire-like count of unique clonotypes per group and clone-size bin",
+                    }
+                )
+    return rows or [{"status": "skipped", "reason": "no occupied clonotypes available"}]
+
+
+def plot_occupied_clonotypes_by_group(occupied_rows: list[dict[str, object]]) -> list[str]:
+    figure_paths: list[str] = []
+    if not occupied_rows:
+        return figure_paths
+    try:
+        import matplotlib.pyplot as plt
+        import pandas as pd
+    except Exception:
+        return figure_paths
+    df = pd.DataFrame(occupied_rows)
+    required = {"grouping_column", "group", "clone_size_bin", "occupied_clonotypes"}
+    if df.empty or not required.issubset(set(df.columns)):
+        return figure_paths
+    df = df.copy()
+    df["occupied_clonotypes"] = pd.to_numeric(df["occupied_clonotypes"], errors="coerce").fillna(0)
+    df = df[df["occupied_clonotypes"] > 0].copy()
+    if df.empty:
+        return figure_paths
+    clone_order = ["Single", "Small", "Medium", "Large", "Hyperexpanded", "Unmatched"]
+    group_priority = [
+        "scrta_condition",
+        "scrta_tissue",
+        "scrta_timepoint",
+        "scrta_sample",
+        "scrta_patient",
+        "scrta_t_cell_cluster",
+        "cell_type",
+    ]
+    groupings = [g for g in group_priority if g in set(df["grouping_column"].astype(str))]
+    groupings.extend(
+        sorted(g for g in set(df["grouping_column"].astype(str)) if g not in set(groupings))
+    )
+    for grouping in groupings:
+        sub = df[df["grouping_column"].astype(str) == grouping].copy()
+        sub = sub[~sub["group"].astype(str).str.lower().isin(["", "nan", "none"])]
+        if sub.empty:
+            continue
+        pivot = sub.pivot_table(
+            index="group",
+            columns="clone_size_bin",
+            values="occupied_clonotypes",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        if pivot.empty:
+            continue
+        available_order = [x for x in clone_order if x in pivot.columns]
+        available_order.extend([x for x in pivot.columns if x not in available_order])
+        pivot = pivot[available_order]
+        totals = pivot.sum(axis=1).sort_values(ascending=False)
+        if len(totals) > 20:
+            keep = list(totals.head(20).index)
+            pivot = pivot.loc[keep]
+        else:
+            pivot = pivot.loc[list(totals.index)]
+        fig_width = max(6.8, min(14.0, 0.42 * len(pivot) + 4.8))
+        fig, ax = plt.subplots(figsize=(fig_width, 4.2))
+        color_map = {
+            "Single": "#BFC7D5",
+            "Small": "#6FA3D2",
+            "Medium": "#2F6B9A",
+            "Large": "#8F5E7D",
+            "Hyperexpanded": "#B65A4A",
+            "Unmatched": "#D7DCE2",
+        }
+        colors = [color_map.get(str(col), "#6F7782") for col in pivot.columns]
+        pivot.plot(kind="bar", stacked=True, ax=ax, color=colors, width=0.82)
+        ax.set_title(f"Occupied clonotypes by clone-size bin: {grouping}")
+        ax.set_xlabel(grouping.replace("scrta_", "").replace("_", " "))
+        ax.set_ylabel("Occupied clonotypes")
+        ax.legend(title="Clone-size bin", frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
+        ax.tick_params(axis="x", rotation=35)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        path = OUTPUT_DIR / "figures" / f"t_cell_occupied_clonotypes_{grouping}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.tight_layout()
+        fig.savefig(path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        figure_paths.append(str(path))
+    return figure_paths
+
+
+def write_t_cell_umap_coordinates(adata_subset, cluster_col: str) -> None:
+    if "X_umap" not in adata_subset.obsm:
+        return
+    try:
+        import pandas as pd
+    except Exception:
+        return
+    coords = pd.DataFrame(
+        {
+            "cell": [str(x) for x in adata_subset.obs_names],
+            "UMAP1": adata_subset.obsm["X_umap"][:, 0],
+            "UMAP2": adata_subset.obsm["X_umap"][:, 1],
+            "t_cell_cluster": adata_subset.obs[cluster_col].astype(str).to_numpy(),
+        }
+    )
+    for col in ["sub_cell_type", "cell_type", "scrta_clone_id", "scrta_clone_size", "scrta_clone_size_bin", "scrta_condition", "scrta_tissue", "scrta_patient"]:
+        if col in adata_subset.obs:
+            coords[col] = adata_subset.obs[col].astype(str).to_numpy()
+    coords.to_csv(OUTPUT_DIR / "t_cell_umap_coordinates.csv", index=False)
+
+
+def plot_t_cell_umaps(adata_subset, cluster_col: str) -> list[str]:
+    figure_paths = []
+    if "X_umap" not in adata_subset.obsm:
+        return figure_paths
+    try:
+        import matplotlib.pyplot as plt
+        import scanpy as sc
+    except Exception:
+        return figure_paths
+    clone_counts = Counter(
+        str(x)
+        for x in adata_subset.obs.get("scrta_clone_id", []).tolist()
+        if str(x) and str(x) != "unassigned"
+    )
+    top_clones = {clone for clone, _ in clone_counts.most_common(20)}
+    if "scrta_clone_id" in adata_subset.obs:
+        adata_subset.obs["scrta_top_clonotype_label"] = [
+            clone if clone in top_clones else ("Other clonotype" if clone != "unassigned" else "Unassigned")
+            for clone in adata_subset.obs["scrta_clone_id"].astype(str).tolist()
+        ]
+    colors = [
+        cluster_col,
+        "sub_cell_type",
+        "cell_type",
+        "scrta_clone_size_bin",
+        "scrta_top_clonotype_label",
+        "scrta_condition",
+    ]
+    for color in [c for c in colors if c in adata_subset.obs]:
+        try:
+            sc.pl.umap(adata_subset, color=color, show=False, size=8 if adata_subset.n_obs <= 50000 else 4)
+            path = OUTPUT_DIR / "figures" / f"t_cell_umap_{color}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(path, dpi=180, bbox_inches="tight")
+            plt.close()
+            figure_paths.append(str(path))
+        except Exception:
+            plt.close()
+    return figure_paths
+
+
+def run_fixed_t_cell_baseline(adata, state_columns: list[str]) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]], list[str]]:
+    mask = t_cell_mask_from_metadata(adata, state_columns)
+    adata.obs["scrta_is_t_cell"] = mask
+    n_t = int(sum(mask))
+    if n_t < 20:
+        skipped = [{"status": "skipped", "reason": f"fewer than 20 T cells detected ({n_t})"}]
+        return skipped, skipped, skipped, []
+    try:
+        import scanpy as sc
+    except Exception:
+        skipped = [{"status": "skipped", "reason": "scanpy unavailable for T-cell reclustering"}]
+        return skipped, skipped, skipped, []
+    tdata = adata[mask, :].copy()
+    messages = []
+    try:
+        sc.pp.normalize_total(tdata, target_sum=1e4)
+        sc.pp.log1p(tdata)
+        sc.pp.highly_variable_genes(tdata, n_top_genes=min(2000, tdata.n_vars))
+        sc.pp.pca(tdata, svd_solver="arpack")
+        n_pcs = min(30, max(2, tdata.obsm["X_pca"].shape[1]))
+        sc.pp.neighbors(tdata, n_neighbors=15, n_pcs=n_pcs)
+        sc.tl.umap(tdata)
+        try:
+            sc.tl.leiden(tdata, resolution=0.8)
+            cluster_col = "leiden"
+        except Exception:
+            sc.tl.louvain(tdata, resolution=0.8)
+            cluster_col = "louvain"
+        tdata.obs["scrta_t_cell_cluster"] = tdata.obs[cluster_col].astype(str)
+        messages.append("T cells reclustered with normalize/log1p/HVG/PCA/kNN/UMAP/graph clustering.")
+    except Exception as exc:
+        if "X_umap" in tdata.obsm and "leiden" in tdata.obs:
+            tdata.obs["scrta_t_cell_cluster"] = tdata.obs["leiden"].astype(str)
+            messages.append(f"T-cell standard reclustering failed; reused existing UMAP/leiden: {exc}")
+        else:
+            skipped = [{"status": "skipped", "reason": f"T-cell reclustering failed: {exc}"}]
+            return skipped, skipped, skipped, []
+
+    adata.obs["scrta_t_cell_cluster"] = "non_T"
+    adata.obs.loc[adata.obs["scrta_is_t_cell"].astype(bool), "scrta_t_cell_cluster"] = tdata.obs["scrta_t_cell_cluster"].astype(str).values
+    cluster_summary = build_t_cell_cluster_summary(tdata, "scrta_t_cell_cluster")
+    for row in cluster_summary:
+        row["workflow_note"] = "; ".join(messages)
+    marker_rows = score_marker_programs_for_subset(tdata, "scrta_t_cell_cluster")
+    occupied_rows = build_occupied_clonotypes_by_group(tdata, "scrta_t_cell_cluster")
+    write_t_cell_umap_coordinates(tdata, "scrta_t_cell_cluster")
+    figure_paths = plot_t_cell_umaps(tdata, "scrta_t_cell_cluster")
+    figure_paths.extend(plot_occupied_clonotypes_by_group(occupied_rows))
+    (OUTPUT_DIR / "t_cell_clone_size_thresholds.json").write_text(
+        json.dumps(CLONE_SIZE_THRESHOLDS, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return cluster_summary, marker_rows, occupied_rows, figure_paths
+
+
+def make_figures(adata, state_columns: list[str]) -> list[str]:
+    figure_paths = []
+    if "X_umap" not in adata.obsm:
+        return figure_paths
+    try:
+        import matplotlib.pyplot as plt
+        import scanpy as sc
+    except Exception:
+        return figure_paths
+
+    colors = [
+        "scrta_tissue",
+        "scrta_patient",
+        "scrta_sample",
+        "scrta_timepoint",
+        "scrta_tcr_matched",
+        "scrta_clone_size_bin",
+    ]
+    colors.extend([c for c in state_columns[:4] if c in adata.obs])
+    colors.extend([c for c in adata.obs.columns if str(c).startswith("scrta_score_")][:4])
+    for color in colors:
+        try:
+            sc.pl.umap(adata, color=color, show=False)
+            path = OUTPUT_DIR / "figures" / f"umap_{color}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(path, dpi=160, bbox_inches="tight")
+            plt.close()
+            figure_paths.append(str(path))
+        except Exception:
+            plt.close()
+    return figure_paths
+
+
+def main() -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    tcr_rows, tcr_columns = read_tcr_rows(TCR_PATH)
+    adata = load_adata()
+    parsed_rows, parse_summary_rows = parse_sample_metadata(adata)
+    join_summary = add_tcr_to_obs(adata, tcr_rows, tcr_columns)
+    embedding_messages = ensure_basic_embedding(adata)
+    signature_summary = score_signatures(adata)
+    state_columns = choose_state_columns([str(c) for c in adata.obs.columns])
+    clone_state_rows = summarize_clone_state(adata, state_columns)
+    patient_summary_rows, patient_test_rows = patient_blocked_stats(adata, state_columns)
+    clone_null_rows = clone_size_aware_null_tests(adata, state_columns)
+    within_signature_rows, within_de_rows = within_state_cd8_treg_analysis(adata, state_columns)
+    sharing_rows = clone_sharing_matrix(adata)
+    t_cell_cluster_rows, t_cell_marker_rows, occupied_clonotype_rows, t_cell_figure_paths = run_fixed_t_cell_baseline(
+        adata, state_columns
+    )
+    figure_paths = make_figures(adata, state_columns)
+    figure_paths.extend(t_cell_figure_paths)
+
+    clone_counts = Counter(
+        str(x)
+        for x in adata.obs["scrta_clone_id"].tolist()
+        if str(x) and str(x) != "unassigned"
+    )
+    obs_export_columns = [
+        c
+        for c in [
+            *state_columns,
+            *[c for c in adata.obs.columns if str(c).startswith("scrta_score_")],
+            "scrta_t_state",
+            "scrta_is_t_cell",
+            "scrta_t_cell_cluster",
+            "scrta_tcr_matched",
+            "scrta_clone_id",
+            "scrta_clone_size",
+            "scrta_clone_size_bin",
+            "scrta_cdr3",
+            "scrta_v_gene",
+            "scrta_j_gene",
+        ]
+        if c in adata.obs.columns
+    ]
+    adata.obs[obs_export_columns].to_csv(OUTPUT_DIR / "joined_obs_summary.csv")
+    safe_write_csv(OUTPUT_DIR / "parsed_sample_metadata.csv", parsed_rows)
+    safe_write_csv(OUTPUT_DIR / "sample_parse_summary.csv", parse_summary_rows)
+    safe_write_csv(OUTPUT_DIR / "clone_state_summary.csv", clone_state_rows)
+    safe_write_csv(OUTPUT_DIR / "signature_summary.csv", signature_summary)
+    safe_write_csv(OUTPUT_DIR / "patient_blocked_summary.csv", patient_summary_rows)
+    safe_write_csv(OUTPUT_DIR / "patient_blocked_tests.csv", patient_test_rows)
+    safe_write_csv(OUTPUT_DIR / "clone_size_null_tests.csv", clone_null_rows)
+    safe_write_csv(OUTPUT_DIR / "within_state_signature_differences.csv", within_signature_rows)
+    safe_write_csv(OUTPUT_DIR / "within_state_de_top_genes.csv", within_de_rows)
+    safe_write_csv(OUTPUT_DIR / "clone_sharing_matrix.csv", sharing_rows)
+    safe_write_csv(OUTPUT_DIR / "t_cell_cluster_summary.csv", t_cell_cluster_rows)
+    safe_write_csv(OUTPUT_DIR / "t_cell_cluster_marker_summary.csv", t_cell_marker_rows)
+    safe_write_csv(OUTPUT_DIR / "t_cell_occupied_clonotypes_by_group.csv", occupied_clonotype_rows)
+    safe_write_csv(
+        OUTPUT_DIR / "top_clones.csv",
+        summarize_counter(clone_counts, "clone_id", "cells", limit=200),
+    )
+
+    summary = {
+        "analysis_name": ANALYSIS_NAME,
+        "rna_path": str(RNA_PATH),
+        "tcr_path": str(TCR_PATH),
+        "n_cells": int(adata.n_obs),
+        "n_genes": int(adata.n_vars),
+        "tcr_rows": len(tcr_rows),
+        "join_summary": join_summary,
+        "state_columns": state_columns,
+        "parsed_metadata_columns": [
+            "scrta_patient",
+            "scrta_sample",
+            "scrta_timepoint",
+            "scrta_tissue",
+            "scrta_condition",
+        ],
+        "dataset_reconnaissance_contract": DATASET_RECONNAISSANCE_CONTRACT,
+        "embedding_messages": embedding_messages,
+        "fixed_baseline_modules": [
+            "10x-like all-cell GEX workflow: normalize/log1p/HVG/PCA/kNN/UMAP/graph clustering",
+            "T-cell extraction and reclustering with UMAP",
+            "T-cell marker table for LLM subcluster annotation",
+            "scRepertoire-like clone-size binning and occupied clonotype counts",
+        ],
+        "clone_size_thresholds": CLONE_SIZE_THRESHOLDS,
+        "figures": figure_paths,
+    }
+    (OUTPUT_DIR / "analysis_summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    report_lines = [
+        f"# {ANALYSIS_NAME} scRNA-scTCR Joint Analysis",
+        "",
+        f"- RNA file: {RNA_PATH}",
+        f"- TCR file: {TCR_PATH}",
+        f"- Cells: {adata.n_obs}",
+        f"- Genes/features: {adata.n_vars}",
+        f"- TCR rows: {len(tcr_rows)}",
+        f"- TCR barcode column: {join_summary.get('barcode_column')}",
+        f"- Clone column: {join_summary.get('clone_column')}",
+        f"- Matched cells: {join_summary.get('matched_cells')}",
+        f"- Matched fraction: {join_summary.get('matched_fraction')}",
+        f"- State/group columns summarized: {', '.join(state_columns) or 'none'}",
+        "",
+        "## Outputs",
+        "- joined_obs_summary.csv",
+        "- parsed_sample_metadata.csv",
+        "- sample_parse_summary.csv",
+        "- clone_state_summary.csv",
+        "- signature_summary.csv",
+        "- patient_blocked_summary.csv",
+        "- patient_blocked_tests.csv",
+        "- clone_size_null_tests.csv",
+        "- within_state_signature_differences.csv",
+        "- within_state_de_top_genes.csv",
+        "- clone_sharing_matrix.csv",
+        "- t_cell_cluster_summary.csv",
+        "- t_cell_cluster_marker_summary.csv",
+        "- t_cell_occupied_clonotypes_by_group.csv",
+        "- t_cell_umap_coordinates.csv",
+        "- t_cell_clone_size_thresholds.json",
+        "- top_clones.csv",
+        "- analysis_summary.json",
+        "- figures/*.png when UMAP and plotting dependencies are available",
+        "",
+        "## Fixed Baseline Analysis",
+        "- All-cell standard 10x-like workflow: normalization/log transform, HVG, PCA, kNN graph, graph clustering, UMAP when scanpy is available or existing UMAP is reused.",
+        "- T-cell extraction followed by T-cell-only graph clustering and UMAP.",
+        "- T-cell cluster marker summary for LLM-based T-cell subcluster annotation.",
+        "- Clone-size bins use scRepertoire-like thresholds: Single=1, Small=2-5, Medium=6-20, Large=21-100, Hyperexpanded>100.",
+        "- occupiedscRepertoire-like table counts occupied clonotypes by group and clone-size bin.",
+        "",
+        "## Conservative Interpretation Rules",
+        "- Treat RNA state/program findings as the lead signal.",
+        "- Treat clone expansion and clone sharing as supporting lineage evidence.",
+        "- Do not infer antigen specificity from expansion alone.",
+        "- Re-run with patient/sample/tissue/timepoint covariates before strong claims.",
+    ]
+    (OUTPUT_DIR / "analysis_summary.md").write_text(
+        "\n".join(report_lines) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Wrote analysis outputs to {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()

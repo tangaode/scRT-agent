@@ -1,0 +1,602 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
+
+ANALYSIS_OUTPUTS = Path($analysis_outputs)
+BIO_DIR = ANALYSIS_OUTPUTS / "biology_mechanism"
+FIG_DIR = BIO_DIR / "figures"
+
+
+PROGRAM_MARKERS = {
+    "cytotoxic": {"GZMB", "PRF1", "NKG7", "GNLY", "GZMA", "GZMH"},
+    "exhaustion_checkpoint": {"PDCD1", "LAG3", "HAVCR2", "TIGIT", "CTLA4", "TOX", "ENTPD1"},
+    "treg_suppression": {"FOXP3", "IL2RA", "CTLA4", "IKZF2", "TIGIT", "TNFRSF18", "CCR8"},
+    "memory_progenitor": {"TCF7", "IL7R", "CCR7", "SELL", "LEF1", "BCL2"},
+    "tissue_residency": {"ITGAE", "CXCR6", "ZNF683", "CD69", "ITGA1"},
+    "interferon": {"IFIT1", "IFIT3", "ISG15", "MX1", "IFI6", "STAT1"},
+    "proliferation": {"MKI67", "TOP2A", "STMN1", "TYMS", "UBE2C"},
+    "trafficking": {"CCR5", "CXCR3", "CXCR4", "CCR7", "CCL5", "CXCL13"},
+}
+
+
+def setup_style() -> None:
+    plt.rcParams.update(
+        {
+            "figure.dpi": 130,
+            "savefig.dpi": 320,
+            "font.size": 9,
+            "axes.titlesize": 10,
+            "axes.labelsize": 9,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 8,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+
+
+def read_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def read_text(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def read_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_csv(name: str, df: pd.DataFrame) -> None:
+    BIO_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_csv(BIO_DIR / name, index=False)
+
+
+def write_md(name: str, lines: list[str]) -> None:
+    BIO_DIR.mkdir(parents=True, exist_ok=True)
+    (BIO_DIR / name).write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def number(value, default: float = float("nan")) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def direction_label(value: float, positive: str = "higher", negative: str = "lower") -> str:
+    if pd.isna(value):
+        return "not available"
+    if value > 1e-9:
+        return positive
+    if value < -1e-9:
+        return negative
+    return "similar"
+
+
+def support_from_effect(value: float, expected_positive: bool = True, threshold: float = 0.05) -> str:
+    if pd.isna(value):
+        return "not assessed"
+    if abs(value) < threshold:
+        return "weak"
+    if expected_positive and value > 0:
+        return "supports"
+    if (not expected_positive) and value < 0:
+        return "supports"
+    return "contrasts"
+
+
+def selected_hypothesis() -> dict:
+    deep = ANALYSIS_OUTPUTS / "deep_dive" / "selected_hypothesis.json"
+    root = ANALYSIS_OUTPUTS.parent / "selected_hypothesis.json"
+    return read_json(deep) or read_json(root)
+
+
+def deep_decision_text() -> str:
+    return read_text(ANALYSIS_OUTPUTS / "deep_dive" / "deep_dive_conclusion.md")
+
+
+def build_signal_table() -> pd.DataFrame:
+    rows = []
+    focus = read_csv(ANALYSIS_OUTPUTS / "deep_dive" / "deep_focus_state_expanded_vs_singleton.csv")
+    if not focus.empty and "clone_class" in focus:
+        focus_state = str(focus.get("focus_state_rule", pd.Series(["focus-state"])).dropna().iloc[0])
+        idx = focus.set_index("clone_class")
+        if "expanded" in idx.index and "singleton" in idx.index:
+            metrics = [
+                ("scrta_score_cytotoxic", "cytotoxic program", True),
+                ("scrta_score_exhaustion", "exhaustion/checkpoint program", True),
+                ("scrta_score_memory_progenitor", "memory-progenitor program", False),
+                ("scrta_score_interferon", "interferon program", True),
+                ("scrta_score_proliferation", "proliferation program", True),
+            ]
+            for metric, label, expected_positive in metrics:
+                col = f"mean_mean_{metric}"
+                if col in idx:
+                    diff = number(idx.loc["expanded", col]) - number(idx.loc["singleton", col])
+                    rows.append(
+                        {
+                            "signal_id": f"focus_state_expanded_vs_singleton_{metric}",
+                            "cell_axis": focus_state,
+                            "comparison": "focus-state expanded clones versus singleton clones",
+                            "program": label,
+                            "effect": diff,
+                            "direction": direction_label(diff),
+                            "support": support_from_effect(diff, expected_positive=expected_positive),
+                            "source_table": "deep_focus_state_expanded_vs_singleton.csv",
+                        }
+                    )
+
+    private = read_csv(ANALYSIS_OUTPUTS / "deep_dive" / "deep_private_shared_clone_summary.csv")
+    if not private.empty and "tissue_class" in private:
+        treg = private[private["t_state"].astype(str).str.contains("Treg", case=False, na=False)]
+        tumor = treg[treg["tissue_class"] == "tumor_private"]
+        blood = treg[treg["tissue_class"] == "blood_private"]
+        if not tumor.empty and not blood.empty:
+            exp_diff = number(tumor["expanded_clone_fraction"].mean()) - number(blood["expanded_clone_fraction"].mean())
+            rows.append(
+                {
+                    "signal_id": "Treg_tumor_private_expansion",
+                    "cell_axis": "Treg-like",
+                    "comparison": "tumor-private clones versus blood-private clones",
+                    "program": "clone expansion",
+                    "effect": exp_diff,
+                    "direction": direction_label(exp_diff),
+                    "support": support_from_effect(exp_diff, expected_positive=True),
+                    "source_table": "deep_private_shared_clone_summary.csv",
+                }
+            )
+            score_col = "clone_mean_mean_scrta_score_treg"
+            if score_col in tumor and score_col in blood:
+                score_diff = number(tumor[score_col].mean()) - number(blood[score_col].mean())
+                rows.append(
+                    {
+                        "signal_id": "Treg_tumor_private_suppressive_program",
+                        "cell_axis": "Treg-like",
+                        "comparison": "tumor-private clones versus blood-private clones",
+                        "program": "Treg suppressive program",
+                        "effect": score_diff,
+                        "direction": direction_label(score_diff),
+                        "support": support_from_effect(score_diff, expected_positive=True),
+                        "source_table": "deep_private_shared_clone_summary.csv",
+                    }
+                )
+
+    tests = read_csv(ANALYSIS_OUTPUTS / "deep_dive" / "deep_patient_level_tests.csv")
+    if not tests.empty and "test" in tests:
+        same = tests[tests["test"] == "same_clone_tissue_program"].copy()
+        for _, row in same.iterrows():
+            pval = number(row.get("sign_test_p_two_sided", ""))
+            effect = number(row.get("median_T_minus_P", ""))
+            if pd.isna(effect):
+                continue
+            metric = str(row.get("metric", "")).replace("scrta_score_", "").replace("_T_minus_P", "")
+            rows.append(
+                {
+                    "signal_id": f"same_clone_{row.get('t_state_pattern', '')}_{metric}",
+                    "cell_axis": str(row.get("t_state_pattern", "")),
+                    "comparison": "same clone tumor minus blood",
+                    "program": metric.replace("_", " "),
+                    "effect": effect,
+                    "direction": "tumor higher" if effect > 0 else "tumor lower" if effect < 0 else "similar",
+                    "support": "patient-significant" if pval <= 0.05 else "observed",
+                    "source_table": "deep_patient_level_tests.csv",
+                }
+            )
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame(
+        [
+            {
+                "signal_id": "no_signal_table",
+                "cell_axis": "",
+                "comparison": "",
+                "program": "",
+                "effect": "",
+                "direction": "",
+                "support": "not assessed",
+                "source_table": "",
+            }
+        ]
+    )
+
+
+def marker_category(gene: str) -> str:
+    gene = str(gene).upper().strip()
+    for category, genes in PROGRAM_MARKERS.items():
+        if gene in genes:
+            return category
+    return "other_or_dataset_specific"
+
+
+def build_gene_program_table() -> pd.DataFrame:
+    de = read_csv(ANALYSIS_OUTPUTS / "within_state_de_top_genes.csv")
+    if de.empty or "gene" not in de:
+        return pd.DataFrame(
+            [{"program_category": "not_assessed", "genes": "", "n_genes": 0, "source_table": "within_state_de_top_genes.csv"}]
+        )
+    clean = de.copy()
+    clean["program_category"] = clean["gene"].map(marker_category)
+    rows = []
+    group_cols = ["t_state", "contrast", "program_category"]
+    for keys, df in clean.groupby([c for c in group_cols if c in clean], dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = {}
+        for col, value in zip([c for c in group_cols if c in clean], keys):
+            row[col] = value
+        genes = [str(x) for x in df.sort_values("abs_mean_diff", ascending=False).get("gene", pd.Series(dtype=str)).head(12)]
+        row.update(
+            {
+                "n_genes": int(len(df)),
+                "genes": ";".join(genes),
+                "max_abs_mean_diff": number(df.get("abs_mean_diff", pd.Series([float("nan")])).max()),
+                "source_table": "within_state_de_top_genes.csv",
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def evidence_lookup(signals: pd.DataFrame, pattern: str) -> list[dict]:
+    if signals.empty or "signal_id" not in signals:
+        return []
+    mask = signals["signal_id"].astype(str).str.contains(pattern, case=False, regex=True)
+    return signals[mask].to_dict(orient="records")
+
+
+def confidence_score(items: list[dict]) -> tuple[int, str]:
+    score = 0
+    for item in items:
+        support = str(item.get("support", ""))
+        effect = abs(number(item.get("effect", 0), 0))
+        if "supports" in support or "patient-significant" in support:
+            score += 2
+        elif "observed" in support or "weak" in support:
+            score += 1
+        if effect >= 0.25:
+            score += 1
+    if score >= 5:
+        return score, "strong"
+    if score >= 3:
+        return score, "moderate"
+    if score >= 1:
+        return score, "exploratory"
+    return score, "not supported by current tables"
+
+
+def summarize_items(items: list[dict]) -> str:
+    parts = []
+    for item in items:
+        effect = item.get("effect", "")
+        try:
+            effect_text = f"{float(effect):.3f}"
+        except Exception:
+            effect_text = str(effect)
+        parts.append(
+            f"{item.get('comparison', '')}: {item.get('program', '')} {item.get('direction', '')} ({effect_text}; {item.get('support', '')})"
+        )
+    return " | ".join(parts) if parts else "No direct signal in current tables."
+
+
+def build_mechanism_map(signals: pd.DataFrame, gene_programs: pd.DataFrame) -> pd.DataFrame:
+    mechanisms = []
+    definitions = [
+        {
+            "mechanism_id": "M1_selected_hypothesis_rna_program_axis",
+            "mechanism": "RNA program evidence relevant to the selected hypothesis",
+            "pattern": "scrta_score_|program|within_state|expanded_vs_singleton|same_clone_",
+            "interpretation": "RNA program shifts provide the primary phenotype layer for judging whether the selected hypothesis is biologically plausible in this dataset.",
+            "downstream": "Run patient-aware module scoring, within-state contrasts, pseudobulk DE, and pathway enrichment targeted to the selected hypothesis.",
+        },
+        {
+            "mechanism_id": "M2_tissue_or_context_program_axis",
+            "mechanism": "Tissue, timepoint, or condition context associated with the selected hypothesis",
+            "pattern": "tissue|timepoint|condition|tumor|blood|post|pre",
+            "interpretation": "Context-stratified evidence helps determine whether the selected hypothesis is linked to tissue compartment, treatment timing, disease condition, or sample structure.",
+            "downstream": "Model the selected RNA programs by patient, tissue, timepoint, and condition; report effect direction and patient consistency.",
+        },
+        {
+            "mechanism_id": "M3_sctcr_support_layer",
+            "mechanism": "scTCR lineage and state-occupancy support for the selected hypothesis",
+            "pattern": "same_clone_",
+            "interpretation": "Same-clone and clone-state evidence can support lineage anchoring, persistence, sharing, or state occupancy, but it does not prove antigen specificity or migration direction.",
+            "downstream": "For shared or expanded clones, model RNA program changes within patient and context, then prioritize receptor follow-up only after RNA support is present.",
+        },
+        {
+            "mechanism_id": "M4_candidate_gene_program_annotation",
+            "mechanism": "Gene-level program annotation for selected-hypothesis follow-up",
+            "pattern": "top_gene|gene|cytotoxic|exhaustion|memory|treg|interferon|residency|trafficking",
+            "interpretation": "Top genes and curated programs can nominate molecular mechanisms that should be tested directly in downstream pathway analyses.",
+            "downstream": "Run formal pathway enrichment or curated gene-set scoring for genes and programs tied to the selected hypothesis.",
+        },
+        {
+            "mechanism_id": "M5_literature_testable_TCR_specificity_layer",
+            "mechanism": "Potential antigen-linked receptor convergence requiring external specificity tests",
+            "pattern": "clone|same_clone_|expanded|receptor|cdr3",
+            "interpretation": "Clone expansion, sharing, and state coupling can nominate receptor lineages, but antigen specificity requires receptor-sequence or experimental evidence.",
+            "downstream": "Use CDR3 alpha/beta, V/J genes, GLIPH2/TCRdist, VDJdb or McPAS-TCR matching, and external validation cohorts before claiming antigen recognition.",
+        },
+    ]
+    for definition in definitions:
+        items = evidence_lookup(signals, definition["pattern"])
+        score, confidence = confidence_score(items)
+        if definition["mechanism_id"] == "M5_literature_testable_TCR_specificity_layer":
+            score = min(score, 2)
+            confidence = "requires receptor-level validation"
+        mechanisms.append(
+            {
+                "mechanism_id": definition["mechanism_id"],
+                "mechanism": definition["mechanism"],
+                "biological_interpretation": definition["interpretation"],
+                "dataset_evidence": summarize_items(items),
+                "evidence_score": score,
+                "confidence": confidence,
+                "recommended_downstream_analysis": definition["downstream"],
+                "source_tables": "deep_dive outputs; within_state_de_top_genes.csv",
+            }
+        )
+    if not gene_programs.empty and "program_category" in gene_programs:
+        non_other = gene_programs[~gene_programs["program_category"].astype(str).isin(["other_or_dataset_specific", "not_assessed"])]
+        if not non_other.empty:
+            examples = []
+            for _, row in non_other.head(8).iterrows():
+                examples.append(f"{row.get('program_category', '')}: {row.get('genes', '')}")
+            mechanisms.append(
+                {
+                    "mechanism_id": "M6_top_gene_program_annotation",
+                    "mechanism": "Gene-level program annotation from within-state contrasts",
+                    "biological_interpretation": "Top within-state genes overlap known immune programs and can guide targeted pathway follow-up.",
+                    "dataset_evidence": " | ".join(examples),
+                    "evidence_score": min(6, int(non_other["n_genes"].sum()) if "n_genes" in non_other else 1),
+                    "confidence": "exploratory",
+                    "recommended_downstream_analysis": "Run formal pathway enrichment or curated module scoring on the top genes from the relevant T state and contrast.",
+                    "source_tables": "within_state_de_top_genes.csv",
+                }
+            )
+    return pd.DataFrame(mechanisms)
+
+
+def build_next_tests(mechanism_df: pd.DataFrame) -> pd.DataFrame:
+    tests = [
+        {
+            "priority": "P1",
+            "test_id": "selected_hypothesis_patient_blocked_program_test",
+            "purpose": "Test whether the RNA programs named by the selected hypothesis hold after patient-aware summarization.",
+            "analysis": "Run patient-blocked module scoring, pseudobulk DE, and pathway enrichment for the selected hypothesis programs; summarize effect direction per patient.",
+            "required_inputs": "joined_obs_summary.csv with score columns; expression matrix for gene-level DE.",
+            "expected_supporting_result": "The selected-hypothesis programs show consistent direction across patients or matched contexts.",
+            "runnable_with_current_outputs": "partially",
+        },
+        {
+            "priority": "P1",
+            "test_id": "selected_hypothesis_context_validation",
+            "purpose": "Test whether the selected hypothesis is linked to the relevant tissue, treatment, disease, or physiological context.",
+            "analysis": "Compare selected-hypothesis programs across tissue/timepoint/condition labels using patient-aware contrasts.",
+            "required_inputs": "joined_obs_summary.csv; patient_blocked_tests.csv; parsed metadata.",
+            "expected_supporting_result": "The context specified by the selected hypothesis shows the expected RNA program direction.",
+            "runnable_with_current_outputs": "yes",
+        },
+        {
+            "priority": "P1",
+            "test_id": "shared_clone_tissue_program_followup",
+            "purpose": "Use scTCR to test whether lineage-anchored cells occupy RNA states relevant to the selected hypothesis.",
+            "analysis": "Rank shared or expanded clones by selected-hypothesis program shifts within patient and context; inspect top clones and paired score plots.",
+            "required_inputs": "deep_shared_clone_tissue_differences.csv; deep_patient_level_tests.csv.",
+            "expected_supporting_result": "Clone-level or same-clone evidence supports state occupancy or persistence relevant to the selected hypothesis.",
+            "runnable_with_current_outputs": "yes",
+        },
+        {
+            "priority": "P2",
+            "test_id": "tcr_motif_and_antigen_database_query",
+            "purpose": "Move from clone-state association toward receptor-level biological interpretation.",
+            "analysis": "Run GLIPH2 or TCRdist on productive CDR3 alpha/beta sequences, then query VDJdb/McPAS-TCR for matching or similar receptors.",
+            "required_inputs": "Productive CDR3 alpha/beta, V gene, J gene, patient labels.",
+            "expected_supporting_result": "Expanded or tumor-enriched clones show motif convergence or database links to tumor/viral/self antigens.",
+            "runnable_with_current_outputs": "depends_on_tcr_sequence_columns",
+        },
+        {
+            "priority": "P2",
+            "test_id": "tumor_microenvironment_ligand_receptor_mapping",
+            "purpose": "Identify candidate cell-cell signals that could explain the selected hypothesis at the tumor microenvironment level.",
+            "analysis": "Run LIANA, CellPhoneDB, or NicheNet between relevant cell states, focusing on ligand-receptor axes connected to the selected hypothesis.",
+            "required_inputs": "Full scRNA expression matrix with non-T-cell annotations and tissue labels.",
+            "expected_supporting_result": "Tumor cell or myeloid compartments nominate ligands consistent with Treg recruitment or CD8 dysfunction.",
+            "runnable_with_current_outputs": "requires_full_expression_and_annotations",
+        },
+        {
+            "priority": "P2",
+            "test_id": "external_cohort_replication",
+            "purpose": "Check whether the selected hypothesis generalizes beyond the current cohort.",
+            "analysis": "Run the same dataset reconnaissance and deep-dive modules on another paired scRNA-scTCR tumor cohort with public gene symbols.",
+            "required_inputs": "Independent paired scRNA-scTCR dataset.",
+            "expected_supporting_result": "The selected hypothesis shows the same direction in an independent paired cohort.",
+            "runnable_with_current_outputs": "no",
+        },
+        {
+            "priority": "P3",
+            "test_id": "experimental_or_orthogonal_validation",
+            "purpose": "Convert computational association into biological evidence.",
+            "analysis": "Validate nominated clones/states by flow/CITE-seq, spatial staining, TCR cloning, or antigen stimulation assays where samples are available.",
+            "required_inputs": "Wet-lab validation material or orthogonal spatial/protein data.",
+            "expected_supporting_result": "Expanded clones or Treg-like tumor-private states show expected protein markers and functional response.",
+            "runnable_with_current_outputs": "no",
+        },
+    ]
+    if not mechanism_df.empty:
+        supported = mechanism_df[mechanism_df["evidence_score"].astype(float) >= 3]["mechanism_id"].tolist()
+        for test in tests:
+            test["linked_mechanisms"] = ";".join(supported[:4])
+    return pd.DataFrame(tests)
+
+
+def make_figures(mechanism_df: pd.DataFrame, signals: pd.DataFrame) -> list[str]:
+    created = []
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not mechanism_df.empty and "evidence_score" in mechanism_df:
+        plot = mechanism_df.sort_values("evidence_score", ascending=True).tail(8)
+        plt.figure(figsize=(7.2, 4.0))
+        plt.barh(plot["mechanism_id"], plot["evidence_score"], color="#486C85")
+        plt.xlabel("Evidence score")
+        plt.title("Mechanism evidence ranking")
+        plt.tight_layout()
+        plt.savefig(FIG_DIR / "mechanism_evidence_ranking.png", bbox_inches="tight")
+        plt.savefig(FIG_DIR / "mechanism_evidence_ranking.pdf", bbox_inches="tight")
+        plt.close()
+        created.extend(["mechanism_evidence_ranking.png", "mechanism_evidence_ranking.pdf"])
+    if not signals.empty and "effect" in signals:
+        sig = signals.copy()
+        sig["effect_numeric"] = pd.to_numeric(sig["effect"], errors="coerce")
+        sig = sig.dropna(subset=["effect_numeric"]).head(16)
+        if not sig.empty:
+            plt.figure(figsize=(7.4, 4.2))
+            labels = sig["signal_id"].astype(str).str.replace("_", " ", regex=False)
+            colors = ["#7A3B3B" if x < 0 else "#3C6B4F" for x in sig["effect_numeric"]]
+            plt.barh(labels, sig["effect_numeric"], color=colors)
+            plt.axvline(0, color="#333333", lw=0.8)
+            plt.xlabel("Effect direction")
+            plt.title("Biological signals used for mechanism mapping")
+            plt.tight_layout()
+            plt.savefig(FIG_DIR / "biology_signal_effects.png", bbox_inches="tight")
+            plt.savefig(FIG_DIR / "biology_signal_effects.pdf", bbox_inches="tight")
+            plt.close()
+            created.extend(["biology_signal_effects.png", "biology_signal_effects.pdf"])
+    return created
+
+
+def write_interpretation(selection: dict, decision_text: str, signals: pd.DataFrame, mechanism_df: pd.DataFrame, figures: list[str]) -> None:
+    hypothesis = selection.get("selected_hypothesis", "No selected hypothesis was found.")
+    decision_lines = [line for line in decision_text.splitlines() if "Supported" in line or "Partially" in line or "Inconclusive" in line]
+    lines = [
+        "# Biological Interpretation",
+        "",
+        "## Selected Hypothesis",
+        hypothesis,
+        "",
+        "## Data-Supported Biological Meaning",
+        "- Interpret these outputs against the selected hypothesis rather than as a fixed CD8/Treg template.",
+        "- RNA programs and patient-aware contrasts are the primary evidence layer.",
+        "- scTCR evidence is a supporting layer for lineage, persistence, clone expansion, shared-clone tracking, state occupancy, repertoire diversity, or receptor follow-up priority.",
+        "- Clone expansion or sharing should not be interpreted as antigen specificity without external receptor-level validation.",
+        "",
+        "## Deep-Dive Decision Context",
+    ]
+    if decision_lines:
+        lines.extend(f"- {line}" for line in decision_lines[:4])
+    else:
+        lines.append("- No calibrated deep-dive decision text was detected.")
+    lines.extend(["", "## Key Signals"])
+    if not signals.empty:
+        for _, row in signals.head(12).iterrows():
+            lines.append(
+                f"- {row.get('signal_id', '')}: {row.get('comparison', '')}; {row.get('program', '')}; {row.get('direction', '')}; support={row.get('support', '')}."
+            )
+    lines.extend(["", "## Mechanism-Level Interpretation"])
+    for _, row in mechanism_df.iterrows():
+        lines.append(f"- {row['mechanism_id']}: {row['biological_interpretation']} Confidence: {row['confidence']}.")
+    if figures:
+        lines.extend(["", "## Figures"])
+        lines.extend(f"- {figure}" for figure in figures)
+    write_md("biological_interpretation.md", lines)
+
+
+def write_mechanism_mapping(mechanism_df: pd.DataFrame, gene_programs: pd.DataFrame) -> None:
+    lines = ["# Mechanism Mapping", ""]
+    for _, row in mechanism_df.iterrows():
+        lines.extend(
+            [
+                f"## {row['mechanism_id']}",
+                f"- Mechanism: {row['mechanism']}",
+                f"- Confidence: {row['confidence']} (score {row['evidence_score']})",
+                f"- Dataset evidence: {row['dataset_evidence']}",
+                f"- Recommended downstream analysis: {row['recommended_downstream_analysis']}",
+                "",
+            ]
+        )
+    lines.extend(["## Gene Program Annotations", ""])
+    if gene_programs.empty:
+        lines.append("- No gene-level program annotations were available.")
+    else:
+        for _, row in gene_programs.head(20).iterrows():
+            label = " / ".join(str(row.get(c, "")) for c in ["t_state", "contrast", "program_category"] if c in row)
+            lines.append(f"- {label}: {row.get('genes', '')}")
+    write_md("mechanism_mapping.md", lines)
+
+
+def write_next_tests(tests: pd.DataFrame) -> None:
+    lines = ["# Next-Test Proposals", ""]
+    for _, row in tests.iterrows():
+        lines.extend(
+            [
+                f"## {row['priority']} {row['test_id']}",
+                f"- Purpose: {row['purpose']}",
+                f"- Analysis: {row['analysis']}",
+                f"- Required inputs: {row['required_inputs']}",
+                f"- Expected supporting result: {row['expected_supporting_result']}",
+                f"- Runnable with current outputs: {row['runnable_with_current_outputs']}",
+                f"- Linked mechanisms: {row.get('linked_mechanisms', '')}",
+                "",
+            ]
+        )
+    write_md("next_test_proposals.md", lines)
+
+
+def main() -> None:
+    setup_style()
+    BIO_DIR.mkdir(parents=True, exist_ok=True)
+    selection = selected_hypothesis()
+    decision_text = deep_decision_text()
+    signals = build_signal_table()
+    gene_programs = build_gene_program_table()
+    mechanisms = build_mechanism_map(signals, gene_programs)
+    tests = build_next_tests(mechanisms)
+    figures = make_figures(mechanisms, signals)
+
+    write_csv("biological_signal_table.csv", signals)
+    write_csv("mechanism_gene_program_table.csv", gene_programs)
+    write_csv("mechanism_evidence_map.csv", mechanisms)
+    write_csv("next_test_proposals.csv", tests)
+    write_interpretation(selection, decision_text, signals, mechanisms, figures)
+    write_mechanism_mapping(mechanisms, gene_programs)
+    write_next_tests(tests)
+
+    summary = {
+        "selected_hypothesis": selection,
+        "n_signals": int(len(signals)),
+        "n_mechanisms": int(len(mechanisms)),
+        "n_next_tests": int(len(tests)),
+        "figures": figures,
+        "outputs": [
+            "biological_signal_table.csv",
+            "mechanism_gene_program_table.csv",
+            "mechanism_evidence_map.csv",
+            "next_test_proposals.csv",
+            "biological_interpretation.md",
+            "mechanism_mapping.md",
+            "next_test_proposals.md",
+        ],
+    }
+    (BIO_DIR / "biological_mechanism_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Wrote biological mechanism outputs to {BIO_DIR}")
+
+
+if __name__ == "__main__":
+    main()

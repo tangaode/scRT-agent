@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Local configuration and credentials
+.env
+*.env
+*.key
+*.pem
+
+# Analysis outputs
+runs/
+outputs/
+analysis_outputs/
+tmp_validation/
+*.h5ad
+*.h5
+*.loom
+*.rds
+*.rda
+*.RData
+*.csv.gz
+*.tsv.gz
+
+# System files
+.DS_Store
+Thumbs.db

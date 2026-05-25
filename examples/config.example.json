@@ -1,0 +1,11 @@
+{
+  "rna_h5ad_path": "/path/to/sample.h5ad",
+  "tcr_path": "/path/to/filtered_contig_annotations.csv",
+  "analysis_name": "example_rna_first_tcr_support",
+  "output_root": "./runs",
+  "research_brief": "Find RNA-defined T cell states with TCR lineage support.",
+  "literature_cards_path": "/path/to/literature_cards.csv",
+  "execute_script": false,
+  "use_llm": true,
+  "model": "gpt-5.4"
+}
