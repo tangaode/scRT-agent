@@ -41,6 +41,7 @@ class ScRTAgentLauncher(tk.Tk):
         self.minsize(1200, 720)
         self.message_queue: queue.Queue = queue.Queue()
         self.worker_thread: threading.Thread | None = None
+        self.llm_test_thread: threading.Thread | None = None
         self.stop_requested = False
 
         self.mode_var = tk.StringVar(value="scrna_sctcr")
@@ -185,6 +186,13 @@ class ScRTAgentLauncher(tk.Tk):
         self.stop_button.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=4)
         ttk.Button(actions, text="Save Current Settings", command=self._save_settings).grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=4)
         ttk.Button(actions, text="Reload Settings", command=lambda: self._load_settings(silent=False)).grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=4)
+        ttk.Button(actions, text="Test LLM Connection", command=self._test_llm_connection).grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=4,
+        )
 
         status = ttk.LabelFrame(right, text="Run Status", padding=8)
         status.grid(row=0, column=0, sticky="ew")
@@ -363,6 +371,24 @@ class ScRTAgentLauncher(tk.Tk):
         self.worker_thread = threading.Thread(target=self._run_worker, args=(settings,), daemon=True)
         self.worker_thread.start()
 
+    def _test_llm_connection(self) -> None:
+        if self.llm_test_thread and self.llm_test_thread.is_alive():
+            messagebox.showinfo("LLM test in progress", "An LLM connection test is already running.")
+            return
+        model = self.model_var.get().strip() or "gpt-5.4"
+        self.status_var.set("Testing LLM")
+        self._append_log(f"\nTesting LLM model access: {model}\n")
+        self.llm_test_thread = threading.Thread(target=self._run_llm_test_worker, args=(model,), daemon=True)
+        self.llm_test_thread.start()
+
+    def _run_llm_test_worker(self, model: str) -> None:
+        try:
+            client = LLMClient(model=model, use_llm=True)
+            client.require_ready()
+            self.message_queue.put(("llm_test_ok", model))
+        except Exception as exc:
+            self.message_queue.put(("llm_test_failed", model, str(exc)))
+
     def _request_stop(self) -> None:
         self.stop_requested = True
         self._append_log("\nStop requested. The current LLM or script call will finish before the workflow can stop.\n")
@@ -374,6 +400,8 @@ class ScRTAgentLauncher(tk.Tk):
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
                 print("Starting scRT-agent GUI run.")
                 llm = LLMClient(model=settings["model"], use_llm=True)
+                print(f"Testing LLM model access before data preparation: {settings['model']}")
+                llm.require_ready()
                 prepared_dir = (
                     Path(settings["output_dir"])
                     / "prepared_inputs"
@@ -424,6 +452,8 @@ class ScRTAgentLauncher(tk.Tk):
                 )
                 state = workflow.run()
                 self.message_queue.put(("run_complete", str(state.run_dir)))
+        except RuntimeError as exc:
+            self.message_queue.put(("run_error", f"Run failed before completion.\n\n{exc}\n"))
         except Exception:
             self.message_queue.put(("run_error", traceback.format_exc()))
 
@@ -605,6 +635,22 @@ class ScRTAgentLauncher(tk.Tk):
                     self._append_log("\n" + message[1] + "\n")
                     self.start_button.configure(state="normal")
                     self.stop_button.configure(state="disabled")
+                elif kind == "llm_test_ok":
+                    self.status_var.set("Ready")
+                    self._append_log(f"LLM connection test passed for model: {message[1]}\n")
+                    messagebox.showinfo("LLM test passed", f"Model is accessible: {message[1]}")
+                elif kind == "llm_test_failed":
+                    self.status_var.set("Ready")
+                    self._append_log(
+                        f"LLM connection test failed for model: {message[1]}\n{message[2]}\n"
+                    )
+                    messagebox.showerror(
+                        "LLM test failed",
+                        (
+                            f"The configured token cannot use model `{message[1]}` or the endpoint is unavailable.\n\n"
+                            "Choose a model that this API key can access, then test again."
+                        ),
+                    )
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
