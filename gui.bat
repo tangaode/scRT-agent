@@ -2,5 +2,5 @@
 setlocal
 cd /d "%~dp0"
 set "PYTHONPATH=%CD%\src;%PYTHONPATH%"
-python -m scrta_agent interactive
+python -m scrta_agent.gui
 pause

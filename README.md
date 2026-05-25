@@ -15,7 +15,8 @@ orthogonal evidence.
 
 ## Features
 
-- Guided interactive workflow through `scrta-agent interactive` or `gui.bat`.
+- Desktop launcher panel through `scrta-agent gui` or `gui.bat`.
+- Guided terminal workflow through `scrta-agent interactive`.
 - LLM-assisted input preparation for common scRNA-seq and scTCR-seq file
   layouts, producing a workflow-ready RNA `.h5ad` file and normalized TCR
   table.
@@ -98,11 +99,19 @@ The default model can be overridden with `--model`.
 For the guided workflow:
 
 ```bash
-scrta-agent interactive
+scrta-agent gui
 ```
 
 On Windows, double-click `gui.bat` from the repository root after installation
-or run it from a terminal.
+or run it from a terminal. The desktop launcher provides file browsers,
+configuration save/reload, run status, live logs and a hypothesis
+selection/editing dialog.
+
+For the terminal wizard:
+
+```bash
+scrta-agent interactive
+```
 
 To prepare inputs without launching the full workflow:
 

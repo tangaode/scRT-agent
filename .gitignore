@@ -16,11 +16,13 @@ dist/
 *.env
 *.key
 *.pem
+.scrta_gui_settings.json
 
 # Analysis outputs
 runs/
 outputs/
 analysis_outputs/
+prepared_inputs/
 tmp_validation/
 *.h5ad
 *.h5

@@ -67,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--no-llm-plan", action="store_true", help="use deterministic input selection")
 
     subparsers.add_parser("interactive", help="start the guided interactive workflow")
+    subparsers.add_parser("gui", help="start the desktop GUI launcher")
     return parser
 
 
@@ -110,6 +111,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "interactive":
         return run_interactive_wizard()
+
+    if args.command == "gui":
+        from .gui import main as run_gui_launcher
+
+        return run_gui_launcher()
 
     parser.print_help()
     return 0

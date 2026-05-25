@@ -4,6 +4,7 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 import shutil
+from typing import Callable
 
 from .agents import ScRTATeam
 from .artifacts import ArtifactStore
@@ -34,12 +35,21 @@ from .skills import load_skill_context
 from .utils import ensure_dir, read_text, slugify, truncate_text, utc_timestamp
 
 
+HypothesisSelectionCallback = Callable[[dict[str, dict[str, object]]], DeepDiveSelection]
+
+
 class ScRTAWorkflow:
     """Pantheon-inspired fixed workflow for paired scRNA/scTCR analysis."""
 
-    def __init__(self, config: WorkflowConfig, llm: LLMClient | None = None) -> None:
+    def __init__(
+        self,
+        config: WorkflowConfig,
+        llm: LLMClient | None = None,
+        hypothesis_selection_callback: HypothesisSelectionCallback | None = None,
+    ) -> None:
         self.config = config
         self.llm = llm or LLMClient(model=config.model, use_llm=config.use_llm)
+        self.hypothesis_selection_callback = hypothesis_selection_callback
 
     def run(self) -> WorkflowState:
         self.config.use_llm = True
@@ -808,6 +818,44 @@ class ScRTAWorkflow:
         store: ArtifactStore,
         state: WorkflowState,
     ) -> tuple[DeepDiveSelection, AgentResponse]:
+        if self.hypothesis_selection_callback is not None:
+            selection = self.hypothesis_selection_callback(generated_candidates)
+        else:
+            selection = self._select_hypothesis_in_console(generated_candidates)
+        selection_payload = selection.to_dict()
+        selection_payload["generator_candidate_count"] = len(generated_candidates)
+        selection_payload["selection_provenance"] = (
+            "The LLM hypothesis_generator produced candidates. The user then selected "
+            "one candidate and could edit the title, hypothesis statement, explanation, "
+            "required tests, falsification criteria, and source tables before deep-dive execution."
+        )
+        selection_payload["llm_hypothesis_generator_artifact"] = "rag_grounded_hypothesis_candidates.md"
+        selection_payload["candidate_index_artifact"] = "hypothesis_candidate_index.json"
+        selection_json = store.write_json("selected_hypothesis", selection_payload)
+        selection_md = store.write_markdown(
+            "selected_hypothesis",
+            selection.to_markdown()
+            + "\n## Selection Provenance\n"
+            + selection_payload["selection_provenance"]
+            + "\n",
+        )
+        self._add_artifact(state, "selected_hypothesis_json", selection_json)
+        self._add_artifact(state, "selected_hypothesis", selection_md)
+        response = AgentResponse(
+            agent_name="interactive_hypothesis_selection",
+            content=selection.to_markdown(),
+            metadata={"mode": "interactive", "role": "human_candidate_selection"},
+        )
+        selector_path = store.write_markdown("agent_interactive_hypothesis_selection", response.content)
+        self._add_artifact(state, "agent_interactive_hypothesis_selection", selector_path)
+        selector_meta = store.write_json("agent_interactive_hypothesis_selection_metadata", asdict(response))
+        self._add_artifact(state, "agent_interactive_hypothesis_selection_metadata", selector_meta)
+        return selection, response
+
+    def _select_hypothesis_in_console(
+        self,
+        generated_candidates: dict[str, dict[str, object]],
+    ) -> DeepDiveSelection:
         print("")
         print("Generated hypothesis candidates")
         print("--------------------------------")
@@ -862,7 +910,7 @@ class ScRTAWorkflow:
             else ["rag_grounded_hypothesis_candidates.md"],
         )
 
-        selection = DeepDiveSelection(
+        return DeepDiveSelection(
             hypothesis_id=selected_id,
             title=title,
             selected_hypothesis=statement,
@@ -876,35 +924,6 @@ class ScRTAWorkflow:
             selection_mode="interactive_candidate_selection_for_deep_dive",
             data_support_level="not_assessed",
         )
-        selection_payload = selection.to_dict()
-        selection_payload["generator_candidate_count"] = len(generated_candidates)
-        selection_payload["selection_provenance"] = (
-            "The LLM hypothesis_generator produced candidates. The user then selected "
-            "one candidate and could edit the title, hypothesis statement, explanation, "
-            "required tests, falsification criteria, and source tables before deep-dive execution."
-        )
-        selection_payload["llm_hypothesis_generator_artifact"] = "rag_grounded_hypothesis_candidates.md"
-        selection_payload["candidate_index_artifact"] = "hypothesis_candidate_index.json"
-        selection_json = store.write_json("selected_hypothesis", selection_payload)
-        selection_md = store.write_markdown(
-            "selected_hypothesis",
-            selection.to_markdown()
-            + "\n## Selection Provenance\n"
-            + selection_payload["selection_provenance"]
-            + "\n",
-        )
-        self._add_artifact(state, "selected_hypothesis_json", selection_json)
-        self._add_artifact(state, "selected_hypothesis", selection_md)
-        response = AgentResponse(
-            agent_name="interactive_hypothesis_selection",
-            content=selection.to_markdown(),
-            metadata={"mode": "interactive", "role": "human_candidate_selection"},
-        )
-        selector_path = store.write_markdown("agent_interactive_hypothesis_selection", response.content)
-        self._add_artifact(state, "agent_interactive_hypothesis_selection", selector_path)
-        selector_meta = store.write_json("agent_interactive_hypothesis_selection_metadata", asdict(response))
-        self._add_artifact(state, "agent_interactive_hypothesis_selection_metadata", selector_meta)
-        return selection, response
 
     def _run_hypothesis_refinement_attempts(
         self,
