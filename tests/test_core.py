@@ -8,6 +8,7 @@ import pytest
 
 from scrta_agent.agents import ScRTATeam
 from scrta_agent.data_import import (
+    choose_rna_sources,
     choose_tcr_sources,
     clone_size_category,
     materialize_input_paths,
@@ -262,6 +263,19 @@ def test_project_folder_archive_materialization_discovers_tcr_tables(tmp_path: P
     assert notes
     assert len(sources) == 1
     assert sources[0].name == "filtered_contig_annotations.csv"
+
+
+def test_h5ad_under_tcr_named_parent_is_valid_rna_input(tmp_path: Path) -> None:
+    project = tmp_path / "scRNA-TCR-project"
+    project.mkdir()
+    h5ad = project / "sample_rna.h5ad"
+    h5ad.write_bytes(b"placeholder")
+
+    sources = choose_rna_sources([h5ad], {})
+    folder_sources = choose_rna_sources([project], {})
+
+    assert sources == [h5ad.resolve()]
+    assert folder_sources == [h5ad.resolve()]
 
 
 def test_llm_client_loads_root_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

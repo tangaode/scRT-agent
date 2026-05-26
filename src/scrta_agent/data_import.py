@@ -606,6 +606,8 @@ def _expand_rna_candidates(paths: list[Path]) -> list[Path]:
         if not path.exists():
             continue
         if path.is_dir():
+            if path.name.lower().endswith(".zarr"):
+                candidates.append(path)
             candidates.extend(_find_loose_10x_matrix_files(path))
             for nested in [
                 "filtered_feature_bc_matrix",
@@ -619,6 +621,9 @@ def _expand_rna_candidates(paths: list[Path]) -> list[Path]:
                 candidates.append(path)
             candidates.extend(
                 child for child in sorted(path.rglob("*")) if child.is_dir() and _looks_like_10x_matrix_dir(child)
+            )
+            candidates.extend(
+                child for child in sorted(path.rglob("*")) if child.is_dir() and child.name.lower().endswith(".zarr")
             )
             candidates.extend(
                 child
@@ -674,7 +679,9 @@ def _looks_like_rna_file(path: Path) -> bool:
         return False
     if _is_loose_10x_matrix_file(path):
         return True
-    if any(token in str(path).lower() for token in ("vdj", "tcr", "contig", "clonotype", "airr")):
+    if name.endswith((".h5ad", ".h5", ".hdf5", ".loom")):
+        return True
+    if any(token in name for token in ("vdj", "tcr", "contig", "clonotype", "airr")):
         return False
     if name.endswith((".csv.gz", ".tsv.gz", ".txt.gz")):
         return True
