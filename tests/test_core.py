@@ -90,6 +90,21 @@ def test_rendered_analysis_script_compiles(tmp_path: Path) -> None:
     assert "plot_occupied_clonotypes_by_group" in script
 
 
+def test_rendered_analysis_script_guards_path_labels(tmp_path: Path) -> None:
+    config = WorkflowConfig(
+        rna_h5ad_path=str(tmp_path / "rna.h5ad"),
+        tcr_path=str(tmp_path / "tcr.csv"),
+        analysis_name="path_label_guard_test",
+        output_root=str(tmp_path),
+    )
+    script = render_joint_analysis_script(config, tmp_path)
+
+    assert "is_path_metadata_column(tissue_col)" in script
+    assert "metadata_value_if_not_path(record.get(tissue_col" in script
+    assert "short_display_label" in script
+    assert 'kind="barh"' in script
+
+
 def test_rendered_deep_dive_script_compiles(tmp_path: Path) -> None:
     selection = DeepDiveSelection(
         hypothesis_id="HYP-1",

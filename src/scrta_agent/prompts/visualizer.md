@@ -38,6 +38,21 @@ Figure design rules:
   expansion or sharing alone.
 - Use conservative English figure titles and labels.
 - Generate only figures that are backed by executed results.
+- Never use full file paths, archive paths, or matrix filenames as axis labels,
+  group names, legend entries, panel annotations, or titles. If a table contains
+  path-like values with `/` or `\`, convert them to concise basename-style
+  sample IDs before plotting.
+- Keep every plotted category label readable. Limit category labels to about
+  30-35 characters, wrap or shorten longer labels, and prefer horizontal plots
+  when more than six categories are shown.
+- Do not create legends with dozens of entries. If a categorical legend would
+  have more than 12 entries, either aggregate to the top categories plus
+  "Other", use direct labels only for the most important groups, or omit that
+  panel.
+- Every saved figure must be visually inspectable without overlapping axis
+  labels, panel titles, legends, or annotations. Use adequate figure size,
+  `tight_layout` or `constrained_layout`, and move legends outside only when
+  there is enough margin.
 
 Script requirements:
 - Return exactly one complete Python script between

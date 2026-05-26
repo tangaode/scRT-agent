@@ -377,6 +377,8 @@ class ScRTAWorkflow:
                     "4. Do not specify a desired figure first and then assume a missing result table exists.",
                     "5. Omit any panel whose required table or image is absent from the inventory.",
                     "6. Do not rely on the old publication_figure_spec renderer or any fixed figure template.",
+                    "7. Never plot full file paths as labels. Convert path-like values to short sample IDs.",
+                    "8. Keep category labels and legends readable; cap or aggregate overcrowded categories.",
                 ]
             )
             visualizer = self._call_and_store(
@@ -393,6 +395,8 @@ class ScRTAWorkflow:
                     "a desired figure first and then point to a table that was not generated. "
                     "If a scientifically desirable panel lacks a real result table, omit it. "
                     "Do not use a fixed figure template, fixed renderer, or JSON figure spec. "
+                    "Do not use full file paths or matrix filenames as group labels; sanitize "
+                    "path-like values into concise sample IDs and avoid overcrowded legends. "
                     "Return the full executable script between PUBLICATION_FIGURE_PYTHON_SCRIPT "
                     "and END_PUBLICATION_FIGURE_PYTHON_SCRIPT."
                 ),

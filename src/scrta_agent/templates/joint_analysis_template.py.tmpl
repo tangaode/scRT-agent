@@ -120,6 +120,27 @@ def find_column(columns: list[str], candidates: list[str]) -> str | None:
     return None
 
 
+def is_path_metadata_column(column: str | None) -> bool:
+    if not column:
+        return False
+    low = str(column).lower()
+    return low in {
+        "input_source_path",
+        "source_path",
+        "file_path",
+        "filepath",
+        "filename",
+        "file",
+    } or low.endswith("_path") or "source_path" in low
+
+
+def metadata_value_if_not_path(value: object) -> object:
+    text = str(value).strip()
+    if "\\" in text or "/" in text:
+        return ""
+    return value
+
+
 def build_clone_identity(
     row: dict[str, str],
     clone_col: str | None,
@@ -206,6 +227,34 @@ def clean_label(value: object) -> str:
     text = str(value).strip()
     if text.lower() in {"", "nan", "none", "na", "null"}:
         return ""
+    if "\\" in text or "/" in text:
+        candidate = text.replace("\\", "/").rstrip("/").split("/")[-1]
+        for suffix in [
+            ".matrix.mtx.gz",
+            ".barcodes.tsv.gz",
+            ".features.tsv.gz",
+            ".genes.tsv.gz",
+            ".matrix.mtx",
+            ".barcodes.tsv",
+            ".features.tsv",
+            ".genes.tsv",
+            ".h5ad",
+            ".hdf5",
+            ".h5",
+            ".csv.gz",
+            ".tsv.gz",
+            ".txt.gz",
+            ".csv",
+            ".tsv",
+            ".txt",
+            ".gz",
+            ".loom",
+            ".zarr",
+        ]:
+            if candidate.lower().endswith(suffix):
+                candidate = candidate[: -len(suffix)]
+                break
+        text = candidate.strip() or text
     return text
 
 
@@ -215,6 +264,13 @@ def first_nonempty(*values: object) -> str:
         if text:
             return text
     return ""
+
+
+def short_display_label(value: object, max_len: int = 34) -> str:
+    text = clean_label(value)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "..."
 
 
 def clone_size_bin_sc_repertoire(size: object, matched: bool = True) -> str:
@@ -241,6 +297,8 @@ def parse_patient(text: str) -> str:
     text = clean_label(text)
     patterns = [
         r"(?i)\b(patient|pt|donor|subject)[_\-\s]*([A-Za-z0-9]+)\b",
+        r"(?i)\b([A-Za-z]{1,5}[-_][A-Za-z]{1,5}[-_][0-9]{2,5})\b",
+        r"(?i)\b([A-Za-z]{1,5}[-_][0-9]{2,5})\b",
         r"(?i)\b(P[0-9]+)\b",
         r"(?i)\b(PT[0-9]+)\b",
     ]
@@ -288,6 +346,10 @@ def parse_sample_metadata(adata) -> tuple[list[dict[str, object]], list[dict[str
     time_col = find_column(obs_columns, ["timepoint", "time_point", "visit", "treatment_time"])
     tissue_col = find_column(obs_columns, ["tissue", "site", "compartment", "source"])
     condition_col = find_column(obs_columns, ["condition", "response", "group", "disease", "treatment"])
+    if is_path_metadata_column(tissue_col):
+        tissue_col = None
+    if is_path_metadata_column(condition_col):
+        condition_col = None
 
     rows = []
     parsed_patient = []
@@ -299,10 +361,10 @@ def parse_sample_metadata(adata) -> tuple[list[dict[str, object]], list[dict[str
     for idx, cell in enumerate(adata.obs_names):
         record = obs.iloc[idx]
         sample = first_nonempty(record.get(sample_col, "") if sample_col else "", cell)
-        patient = first_nonempty(record.get(patient_col, "") if patient_col else "", parse_patient(sample), parse_patient(cell))
-        timepoint = first_nonempty(record.get(time_col, "") if time_col else "", parse_timepoint(sample), parse_timepoint(cell))
-        tissue = first_nonempty(record.get(tissue_col, "") if tissue_col else "", parse_tissue(sample), parse_tissue(cell))
-        condition = first_nonempty(record.get(condition_col, "") if condition_col else "")
+        patient = first_nonempty(record.get(patient_col, "") if patient_col else "", parse_patient(sample), parse_patient(cell), sample)
+        timepoint = first_nonempty(metadata_value_if_not_path(record.get(time_col, "")) if time_col else "", parse_timepoint(sample), parse_timepoint(cell))
+        tissue = first_nonempty(metadata_value_if_not_path(record.get(tissue_col, "")) if tissue_col else "", parse_tissue(sample), parse_tissue(cell))
+        condition = first_nonempty(metadata_value_if_not_path(record.get(condition_col, "")) if condition_col else "")
         parsed_patient.append(patient)
         parsed_sample.append(sample)
         parsed_time.append(timepoint)
@@ -1130,13 +1192,16 @@ def plot_occupied_clonotypes_by_group(occupied_rows: list[dict[str, object]]) ->
         available_order.extend([x for x in pivot.columns if x not in available_order])
         pivot = pivot[available_order]
         totals = pivot.sum(axis=1).sort_values(ascending=False)
-        if len(totals) > 20:
-            keep = list(totals.head(20).index)
+        if len(totals) > 12:
+            keep = list(totals.head(12).index)
             pivot = pivot.loc[keep]
         else:
             pivot = pivot.loc[list(totals.index)]
-        fig_width = max(6.8, min(14.0, 0.42 * len(pivot) + 4.8))
-        fig, ax = plt.subplots(figsize=(fig_width, 4.2))
+        display_index = [short_display_label(x, 34) for x in pivot.index]
+        if len(set(display_index)) == len(display_index):
+            pivot.index = display_index
+        fig_height = max(4.2, min(8.2, 0.34 * len(pivot) + 2.8))
+        fig, ax = plt.subplots(figsize=(8.2, fig_height))
         color_map = {
             "Single": "#BFC7D5",
             "Small": "#6FA3D2",
@@ -1146,12 +1211,12 @@ def plot_occupied_clonotypes_by_group(occupied_rows: list[dict[str, object]]) ->
             "Unmatched": "#D7DCE2",
         }
         colors = [color_map.get(str(col), "#6F7782") for col in pivot.columns]
-        pivot.plot(kind="bar", stacked=True, ax=ax, color=colors, width=0.82)
+        pivot.plot(kind="barh", stacked=True, ax=ax, color=colors, width=0.82)
         ax.set_title(f"Occupied clonotypes by clone-size bin: {grouping}")
-        ax.set_xlabel(grouping.replace("scrta_", "").replace("_", " "))
-        ax.set_ylabel("Occupied clonotypes")
+        ax.set_xlabel("Occupied clonotypes")
+        ax.set_ylabel(grouping.replace("scrta_", "").replace("_", " "))
         ax.legend(title="Clone-size bin", frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
-        ax.tick_params(axis="x", rotation=35)
+        ax.tick_params(axis="y", labelsize=8)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
         path = OUTPUT_DIR / "figures" / f"t_cell_occupied_clonotypes_{grouping}.png"
