@@ -138,7 +138,8 @@ and downstream plans for that selected hypothesis can be reviewed in the Plan
 Review panel before execution. The panel shows a short numbered list of next
 analyses, while the full generated plan and script remain available as run
 artifacts. User feedback is sent back to the planning agent so it can revise
-the plan and script before running.
+the plan before a separate implementation step writes and runs the Python
+script.
 
 For the terminal wizard:
 

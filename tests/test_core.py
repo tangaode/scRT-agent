@@ -299,6 +299,24 @@ END_DEEP_DIVE_PYTHON_SCRIPT
     assert "Review the selected hypothesis" in display
 
 
+def test_plan_review_display_prefers_explicit_summary_block() -> None:
+    plan_text = """
+PLAN_REVIEW_SUMMARY
+1. Identify recurrent clonotypes that appear in at least two timepoints within the same patient.
+2. Compare cytotoxic program scores between recurrent and non-recurrent clonotypes.
+3. Test whether recurrent clonotypes remain enriched in the same cytotoxic effector T-cell state.
+END_PLAN_REVIEW_SUMMARY
+
+Detailed plan text and implementation notes can be longer here.
+"""
+
+    display = ScRTAWorkflow._render_plan_review_display("Deep-Dive", plan_text)
+
+    assert "Identify recurrent clonotypes" in display
+    assert "Compare cytotoxic program scores" in display
+    assert "Detailed plan text" not in display
+
+
 def test_llm_client_loads_root_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     env_file = tmp_path / ".scrta_agent.env"
     env_file.write_text(

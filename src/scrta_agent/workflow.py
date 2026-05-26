@@ -768,23 +768,25 @@ class ScRTAWorkflow:
         planner_context["rag_grounded_hypothesis_candidates"] = generator.content
         planner_context["rag_grounded_selector_review"] = selector_review_content
         planner_context["dataset_reconnaissance_context"] = dataset_reconnaissance_context
-        planner_context["deep_dive_runtime_contract"] = self._render_deep_dive_runtime_contract(state.run_dir)
         planner = self._call_and_store(
             team,
             store,
             state,
             "deep_planner",
             (
-                "Create and implement the targeted second-stage validation plan for the selected "
-                "hypothesis. Do not use a fixed CD8/Treg/clone validation program; choose only "
-                "analyses that directly test this selected biological claim. Output a "
-                "hypothesis-specific execution contract and a complete standalone Python script "
-                "between DEEP_DIVE_PYTHON_SCRIPT and END_DEEP_DIVE_PYTHON_SCRIPT."
+                "Create the targeted second-stage validation plan for the selected hypothesis. "
+                "This is a PLAN-ONLY step for user review. Do not write Python code, do not emit "
+                "DEEP_DIVE_PYTHON_SCRIPT, and do not describe yourself as implementing a validator. "
+                "Start with a PLAN_REVIEW_SUMMARY block containing 3-8 concrete numbered analyses "
+                "that a user can understand. Then write a detailed hypothesis-specific analysis "
+                "plan with exact comparison axes, required local tables, scTCR support if relevant, "
+                "and falsification/stopping rules. The plan must directly test this selected "
+                "biological claim and must not use a fixed CD8/Treg/clone validation program."
             ),
             self._context_with_rag(
                 planner_context,
                 rag_chunks,
-                "deep-dive validation selected biological hypothesis RAG-guided dataset-specific tests",
+                "plan selected hypothesis deep-dive validation RAG-guided dataset-specific tests",
                 store=store,
                 state=state,
                 agent_name="deep_planner",
@@ -800,12 +802,12 @@ class ScRTAWorkflow:
                 plan_text=planner.content,
                 revision_agent_name="deep_planner",
                 revision_instruction=(
-                    "Revise the selected-hypothesis deep-dive plan according to the user's "
-                    "interactive feedback. Keep the selected hypothesis fixed unless the user "
-                    "explicitly edits its wording. Add, remove, or reprioritize analyses as "
-                    "requested, then return the full revised execution contract and complete "
-                    "standalone Python script between DEEP_DIVE_PYTHON_SCRIPT and "
-                    "END_DEEP_DIVE_PYTHON_SCRIPT."
+                    "Revise the selected-hypothesis deep-dive analysis plan according to the "
+                    "user's interactive feedback. This remains a PLAN-ONLY step. Do not write "
+                    "Python code and do not emit DEEP_DIVE_PYTHON_SCRIPT. Keep the selected "
+                    "hypothesis fixed unless the user explicitly edits its wording. Return a "
+                    "PLAN_REVIEW_SUMMARY block with concrete numbered analyses, followed by the "
+                    "full revised plan."
                 ),
                 revision_context={
                     **planner_context,
@@ -820,14 +822,50 @@ class ScRTAWorkflow:
         deep_plan_path = store.write_markdown("selected_hypothesis_deep_dive_plan", planner.content)
         self._add_artifact(state, "selected_hypothesis_deep_dive_plan", deep_plan_path)
 
+        implementation_context = dict(planner_context)
+        implementation_context["confirmed_deep_dive_plan"] = planner.content
+        implementation_context["deep_dive_runtime_contract"] = self._render_deep_dive_runtime_contract(state.run_dir)
+        implementation_context["plan_implementation_requirement"] = "\n".join(
+            [
+                "Implement the confirmed selected-hypothesis deep-dive plan exactly.",
+                "Do not replace the confirmed plan with a generic validator.",
+                "The Python script must execute the concrete analyses listed in PLAN_REVIEW_SUMMARY when feasible.",
+                "If a confirmed analysis cannot be run from local outputs, write an explicit skipped reason.",
+                "Return a complete standalone Python script between DEEP_DIVE_PYTHON_SCRIPT and END_DEEP_DIVE_PYTHON_SCRIPT.",
+            ]
+        )
+        implementation = self._call_and_store(
+            team,
+            store,
+            state,
+            "deep_planner",
+            (
+                "Write the Python implementation for the confirmed deep-dive plan. Do not create "
+                "a new plan and do not substitute a generic validator. Preserve the selected "
+                "hypothesis and implement the confirmed analysis steps as directly as local "
+                "outputs allow. Return the full executable script between DEEP_DIVE_PYTHON_SCRIPT "
+                "and END_DEEP_DIVE_PYTHON_SCRIPT."
+            ),
+            self._context_with_rag(
+                implementation_context,
+                rag_chunks,
+                "implement confirmed selected hypothesis deep-dive plan scRNA scTCR Python",
+                store=store,
+                state=state,
+                agent_name="deep_planner_code",
+            ),
+            artifact_name="agent_deep_planner_code",
+        )
+        responses.append(implementation)
+
         try:
-            deep_script_text = render_deep_dive_script(state.run_dir, selection, planner.content)
+            deep_script_text = render_deep_dive_script(state.run_dir, selection, implementation.content)
         except ValueError as exc:
             path = store.write_markdown(
                 "hypothesis_deep_dive_execution",
                 (
                     "# Hypothesis Deep-Dive Execution\n\n"
-                    "Failed before execution because the deep_planner did not emit a valid Python script block.\n\n"
+                    "Failed before execution because the deep_planner code step did not emit a valid Python script block.\n\n"
                     f"Error: {exc}\n"
                 ),
             )
@@ -840,7 +878,7 @@ class ScRTAWorkflow:
             store=store,
             state=state,
             script_path=deep_script_path,
-            deep_context=planner_context,
+            deep_context=implementation_context,
             selection=selection,
             rag_chunks=rag_chunks,
         )
@@ -1216,7 +1254,6 @@ class ScRTAWorkflow:
             planner_context["rag_grounded_hypothesis_candidates"] = generator.content
             planner_context["rag_grounded_selector_review"] = selector.content
             planner_context["dataset_reconnaissance_context"] = dataset_reconnaissance_context
-            planner_context["deep_dive_runtime_contract"] = self._render_deep_dive_runtime_contract(state.run_dir)
             planner_context["rejected_hypotheses_from_prior_attempts"] = json.dumps(
                 rejected_hypotheses,
                 ensure_ascii=False,
@@ -1228,17 +1265,17 @@ class ScRTAWorkflow:
                 state,
                 "deep_planner",
                 (
-                    "Create and implement a targeted second-stage validation plan for this replacement "
-                    "hypothesis. Do not repeat tests whose failure already rejected prior hypotheses "
-                    "unless they are needed as controls. Choose analyses that directly test this "
-                    "selected biological claim. Output a hypothesis-specific execution contract and a "
-                    "complete standalone Python script between DEEP_DIVE_PYTHON_SCRIPT and "
-                    "END_DEEP_DIVE_PYTHON_SCRIPT."
+                    "Create a targeted second-stage validation plan for this replacement hypothesis. "
+                    "This is a PLAN-ONLY step. Do not write Python code and do not emit "
+                    "DEEP_DIVE_PYTHON_SCRIPT. Do not repeat tests whose failure already rejected "
+                    "prior hypotheses unless they are needed as controls. Start with a "
+                    "PLAN_REVIEW_SUMMARY block containing concrete numbered analyses, then write "
+                    "the detailed plan."
                 ),
                 self._context_with_rag(
                     planner_context,
                     rag_chunks,
-                    "replacement hypothesis deep-dive validation RAG dataset-specific tests",
+                    "plan replacement hypothesis deep-dive validation RAG dataset-specific tests",
                     store=store,
                     state=state,
                     agent_name=f"deep_planner_{attempt_label}",
@@ -1253,15 +1290,50 @@ class ScRTAWorkflow:
             self._add_artifact(state, f"{attempt_label}_selected_hypothesis_deep_dive_plan", attempt_deep_plan_path)
             self._add_artifact(state, "selected_hypothesis_deep_dive_plan", canonical_deep_plan_path)
 
+            implementation_context = dict(planner_context)
+            implementation_context["confirmed_deep_dive_plan"] = planner.content
+            implementation_context["deep_dive_runtime_contract"] = self._render_deep_dive_runtime_contract(state.run_dir)
+            implementation_context["plan_implementation_requirement"] = "\n".join(
+                [
+                    "Implement the confirmed replacement-hypothesis deep-dive plan exactly.",
+                    "Do not replace the confirmed plan with a generic validator.",
+                    "Return a complete standalone Python script between DEEP_DIVE_PYTHON_SCRIPT and END_DEEP_DIVE_PYTHON_SCRIPT.",
+                ]
+            )
+            implementation = self._call_and_store(
+                team,
+                store,
+                state,
+                "deep_planner",
+                (
+                    "Write the Python implementation for the confirmed replacement-hypothesis "
+                    "deep-dive plan. Do not create a new plan and do not substitute a generic "
+                    "validator. Return the full executable script between DEEP_DIVE_PYTHON_SCRIPT "
+                    "and END_DEEP_DIVE_PYTHON_SCRIPT."
+                ),
+                self._context_with_rag(
+                    implementation_context,
+                    rag_chunks,
+                    "implement confirmed replacement hypothesis deep-dive plan scRNA scTCR Python",
+                    store=store,
+                    state=state,
+                    agent_name=f"deep_planner_code_{attempt_label}",
+                ),
+                artifact_name=f"{attempt_label}_agent_deep_planner_code",
+            )
+            responses.append(implementation)
+            canonical_implementation = store.write_markdown("agent_deep_planner_code", implementation.content)
+            self._add_artifact(state, "agent_deep_planner_code", canonical_implementation)
+
             shutil.rmtree(state.run_dir / "analysis_outputs" / "deep_dive", ignore_errors=True)
             try:
-                deep_script_text = render_deep_dive_script(state.run_dir, selection, planner.content)
+                deep_script_text = render_deep_dive_script(state.run_dir, selection, implementation.content)
             except ValueError as exc:
                 path = store.write_markdown(
                     "hypothesis_deep_dive_execution",
                     (
                         "# Hypothesis Deep-Dive Execution\n\n"
-                        "Failed before execution because the deep_planner did not emit a valid Python script block.\n\n"
+                        "Failed before execution because the deep_planner code step did not emit a valid Python script block.\n\n"
                         f"Error: {exc}\n"
                     ),
                 )
@@ -1274,7 +1346,7 @@ class ScRTAWorkflow:
                 store=store,
                 state=state,
                 script_path=deep_script_path,
-                deep_context=planner_context,
+                deep_context=implementation_context,
                 selection=selection,
                 rag_chunks=rag_chunks,
             )
@@ -1935,7 +2007,7 @@ class ScRTAWorkflow:
         downstream_context = dict(base_context)
         downstream_context["selected_hypothesis"] = read_text(selected_hypothesis_path)
         downstream_context["dataset_reconnaissance_context"] = self._render_dataset_reconnaissance_context(state.run_dir)
-        downstream_context["downstream_runtime_contract"] = "\n".join(
+        downstream_runtime_contract = "\n".join(
             [
                 "# Downstream Runtime Contract",
                 "",
@@ -1989,13 +2061,16 @@ class ScRTAWorkflow:
             state,
             "downstream_analyst",
             (
-                "Design and implement the selected-hypothesis downstream analysis after reading RAG, "
-                "dataset reconnaissance outputs, deep-dive results, biological interpretation, and mechanism mapping. "
-                "Do not rely on a fixed downstream template. Output a hypothesis-specific execution contract and a "
-                "complete standalone Python script between DOWNSTREAM_PYTHON_SCRIPT and END_DOWNSTREAM_PYTHON_SCRIPT. "
-                "Do not force pseudobulk, pathway, repertoire, clone-state, same-clone, or receptor modules. "
-                "Consider scTCR because this is a paired dataset, but include only scTCR analyses that are "
-                "scientifically relevant to the selected hypothesis and feasible from available outputs."
+                "Design the selected-hypothesis downstream analysis after reading RAG, dataset "
+                "reconnaissance outputs, deep-dive results, biological interpretation, and mechanism "
+                "mapping. This is a PLAN-ONLY step for user review. Do not write Python code and do "
+                "not emit DOWNSTREAM_PYTHON_SCRIPT. Start with a PLAN_REVIEW_SUMMARY block containing "
+                "3-8 concrete numbered analyses that a user can understand. Then write a detailed "
+                "hypothesis-specific downstream plan. Do not rely on a fixed downstream template. "
+                "Do not force pseudobulk, pathway, repertoire, clone-state, same-clone, or receptor "
+                "modules. Consider scTCR because this is a paired dataset, but include only scTCR "
+                "analyses that are scientifically relevant to the selected hypothesis and feasible "
+                "from available outputs."
             ),
             self._context_with_rag(
                 downstream_context,
@@ -2020,11 +2095,11 @@ class ScRTAWorkflow:
                 revision_agent_name="downstream_analyst",
                 revision_instruction=(
                     "Revise the selected-hypothesis downstream analysis plan according to "
-                    "the user's interactive feedback. Keep the selected hypothesis and "
-                    "executed deep-dive result context fixed, add or remove downstream "
-                    "analyses as requested, and return a hypothesis-specific execution "
-                    "contract plus a complete standalone Python script between "
-                    "DOWNSTREAM_PYTHON_SCRIPT and END_DOWNSTREAM_PYTHON_SCRIPT."
+                    "the user's interactive feedback. This remains a PLAN-ONLY step. Do not "
+                    "write Python code and do not emit DOWNSTREAM_PYTHON_SCRIPT. Keep the "
+                    "selected hypothesis and executed deep-dive result context fixed, add or "
+                    "remove downstream analyses as requested, and return a PLAN_REVIEW_SUMMARY "
+                    "block with concrete numbered analyses followed by the full revised plan."
                 ),
                 revision_context={
                     **downstream_context,
@@ -2037,14 +2112,53 @@ class ScRTAWorkflow:
             downstream_analyst = reviewed_downstream
             responses.extend(review_responses)
 
+        downstream_plan_path = store.write_markdown("selected_hypothesis_downstream_plan", downstream_analyst.content)
+        self._add_artifact(state, "selected_hypothesis_downstream_plan", downstream_plan_path)
+
+        downstream_implementation_context = dict(downstream_context)
+        downstream_implementation_context["confirmed_downstream_plan"] = downstream_analyst.content
+        downstream_implementation_context["downstream_runtime_contract"] = downstream_runtime_contract
+        downstream_implementation_context["plan_implementation_requirement"] = "\n".join(
+            [
+                "Implement the confirmed selected-hypothesis downstream plan exactly.",
+                "Do not replace the confirmed plan with a generic downstream workflow.",
+                "The Python script must execute the concrete analyses listed in PLAN_REVIEW_SUMMARY when feasible.",
+                "If a confirmed analysis cannot be run from local outputs, write an explicit skipped reason.",
+                "Return a complete standalone Python script between DOWNSTREAM_PYTHON_SCRIPT and END_DOWNSTREAM_PYTHON_SCRIPT.",
+            ]
+        )
+        downstream_code = self._call_and_store(
+            team,
+            store,
+            state,
+            "downstream_analyst",
+            (
+                "Write the Python implementation for the confirmed downstream plan. Do not create "
+                "a new plan and do not substitute a generic workflow. Preserve the selected "
+                "hypothesis and implement the confirmed downstream analysis steps as directly as "
+                "local outputs allow. Return the full executable script between "
+                "DOWNSTREAM_PYTHON_SCRIPT and END_DOWNSTREAM_PYTHON_SCRIPT."
+            ),
+            self._context_with_rag(
+                downstream_implementation_context,
+                rag_chunks,
+                "implement confirmed downstream selected hypothesis plan scRNA scTCR Python",
+                store=store,
+                state=state,
+                agent_name="downstream_analyst_code",
+            ),
+            artifact_name="agent_downstream_analyst_code",
+        )
+        responses.append(downstream_code)
+
         try:
-            script_text = render_downstream_analysis_script(state.run_dir, downstream_analyst.content)
+            script_text = render_downstream_analysis_script(state.run_dir, downstream_code.content)
         except ValueError as exc:
             path = store.write_markdown(
                 "hypothesis_downstream_execution",
                 (
                     "# Hypothesis Downstream Analysis Execution\n\n"
-                    "Failed before execution because the downstream_analyst did not emit a valid Python script block.\n\n"
+                    "Failed before execution because the downstream_analyst code step did not emit a valid Python script block.\n\n"
                     f"Error: {exc}\n"
                 ),
             )
@@ -2057,7 +2171,7 @@ class ScRTAWorkflow:
             store=store,
             state=state,
             script_path=script_path,
-            downstream_context=downstream_context,
+            downstream_context=downstream_implementation_context,
             rag_chunks=rag_chunks,
         )
         self._add_artifact(state, "hypothesis_downstream_execution", status_path)
@@ -2740,7 +2854,9 @@ class ScRTAWorkflow:
     @staticmethod
     def _render_plan_review_display(stage: str, plan_text: str) -> str:
         compact = ScRTAWorkflow._strip_executable_blocks(plan_text)
-        items = ScRTAWorkflow._extract_user_facing_plan_items(compact, max_items=8)
+        items = ScRTAWorkflow._extract_plan_review_summary_items(compact)
+        if not items:
+            items = ScRTAWorkflow._extract_user_facing_plan_items(compact, max_items=8)
         if not items:
             items = ScRTAWorkflow._fallback_plan_review_items(stage, compact)
 
@@ -2761,6 +2877,27 @@ class ScRTAWorkflow:
             ]
         )
         return "\n".join(lines)
+
+    @staticmethod
+    def _extract_plan_review_summary_items(plan_text: str) -> list[str]:
+        match = re.search(
+            r"PLAN_REVIEW_SUMMARY\s*(.*?)\s*END_PLAN_REVIEW_SUMMARY",
+            plan_text or "",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return []
+        block = match.group(1).strip()
+        items: list[str] = []
+        for raw_line in block.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            candidate = re.sub(r"^(?:[-*+]|\d+[\.)])\s+", "", line).strip()
+            candidate = ScRTAWorkflow._clean_plan_item(candidate)
+            if candidate and "[truncated]" not in candidate.lower() and candidate not in items:
+                items.append(candidate)
+        return items[:8]
 
     @staticmethod
     def _strip_executable_blocks(plan_text: str) -> str:
