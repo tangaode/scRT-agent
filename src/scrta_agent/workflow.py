@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 import json
 from pathlib import Path
+import re
 import shutil
 from typing import Callable
 
@@ -512,19 +513,10 @@ class ScRTAWorkflow:
         rag_query: str,
         artifact_prefix: str,
     ) -> tuple[AgentResponse, list[AgentResponse]]:
-        plan_context = "\n".join(
-            [
-                f"# {stage} Plan Review",
-                "",
-                "This plan was generated after hypothesis selection and before execution.",
-                "User feedback will be sent back to the same planning agent so it can revise the plan and script.",
-                "",
-                "## Generated Plan",
-                "",
-                plan_text.strip(),
-                "",
-            ]
-        )
+        full_plan_path = store.write_markdown(f"{artifact_prefix}_full_plan_for_review", plan_text.strip() + "\n")
+        self._add_artifact(state, f"{artifact_prefix}_full_plan_for_review", full_plan_path)
+
+        plan_context = self._render_plan_review_display(stage, plan_text)
         context_path = store.write_markdown(f"{artifact_prefix}_interactive_plan_review_context", plan_context)
         self._add_artifact(state, f"{artifact_prefix}_interactive_plan_review_context", context_path)
 
@@ -559,6 +551,7 @@ class ScRTAWorkflow:
         revision_context = dict(revision_context)
         revision_context["interactive_plan_review_context"] = plan_context
         revision_context["interactive_plan_feedback"] = feedback
+        revision_context["original_full_plan_for_review"] = plan_text
         revised_plan = self._call_and_store(
             team,
             store,
@@ -2743,6 +2736,168 @@ class ScRTAWorkflow:
                 break
             lines.append(line)
         return "\n".join(lines).strip()
+
+    @staticmethod
+    def _render_plan_review_display(stage: str, plan_text: str) -> str:
+        compact = ScRTAWorkflow._strip_executable_blocks(plan_text)
+        items = ScRTAWorkflow._extract_user_facing_plan_items(compact, max_items=8)
+        if not items:
+            fallback = truncate_text(" ".join(line.strip() for line in compact.splitlines() if line.strip()), 1200)
+            items = [fallback] if fallback else ["No concise analysis step could be extracted from the generated plan."]
+
+        lines = [
+            f"# {stage} Plan Review",
+            "",
+            "The workflow will run these analyses next:",
+            "",
+        ]
+        for index, item in enumerate(items, start=1):
+            lines.append(f"{index}. {item}")
+        lines.extend(
+            [
+                "",
+                "Edit this plan by typing requested changes below. For example, ask to add an analysis, remove a step,",
+                "focus on a specific group or cell state, or change the validation priority.",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _strip_executable_blocks(plan_text: str) -> str:
+        compact = re.sub(
+            r"(?is)DEEP_DIVE_PYTHON_SCRIPT.*?END_DEEP_DIVE_PYTHON_SCRIPT",
+            "",
+            plan_text,
+        )
+        compact = re.sub(
+            r"(?is)DOWNSTREAM_PYTHON_SCRIPT.*?END_DOWNSTREAM_PYTHON_SCRIPT",
+            "",
+            compact,
+        )
+        compact = re.sub(r"(?is)```(?:python|json|text|bash|shell)?\s*.*?```", "", compact)
+        return compact
+
+    @staticmethod
+    def _extract_user_facing_plan_items(plan_text: str, max_items: int = 8) -> list[str]:
+        skip_section = False
+        items: list[str] = []
+        for raw_line in plan_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                title = line.lstrip("#").strip().lower()
+                skip_section = any(
+                    token in title
+                    for token in [
+                        "execution contract",
+                        "runtime contract",
+                        "script",
+                        "artifact",
+                        "manifest",
+                        "output files",
+                        "file paths",
+                    ]
+                )
+                continue
+            if skip_section:
+                continue
+
+            candidate = ""
+            match = re.match(r"^(?:[-*+]|\d+[\.)])\s+(.*)$", line)
+            if match:
+                candidate = match.group(1).strip()
+            elif re.match(r"^(?:aim|objective|analysis|test|step|module)\b[:\s-]", line, flags=re.IGNORECASE):
+                candidate = line
+            if not candidate:
+                continue
+
+            candidate = ScRTAWorkflow._clean_plan_item(candidate)
+            if ScRTAWorkflow._is_user_facing_analysis_item(candidate):
+                items.append(candidate)
+            if len(items) >= max_items:
+                return items
+
+        if len(items) >= 3:
+            return items
+
+        sentences = re.split(r"(?<=[.!?])\s+", " ".join(line.strip() for line in plan_text.splitlines()))
+        for sentence in sentences:
+            candidate = ScRTAWorkflow._clean_plan_item(sentence)
+            if ScRTAWorkflow._is_user_facing_analysis_item(candidate) and candidate not in items:
+                items.append(candidate)
+            if len(items) >= max_items:
+                break
+        return items
+
+    @staticmethod
+    def _clean_plan_item(item: str) -> str:
+        item = re.sub(r"[*_`#]+", "", item).strip()
+        item = re.sub(r"^\[(?: |x|X)\]\s*", "", item).strip()
+        item = re.sub(r"^(?:task|analysis|test|step|module)\s*\d*[:.)-]\s*", "", item, flags=re.IGNORECASE)
+        item = re.sub(r"\s+", " ", item).strip(" -:;")
+        return truncate_text(item, 230)
+
+    @staticmethod
+    def _is_user_facing_analysis_item(item: str) -> bool:
+        if len(item) < 18:
+            return False
+        lowered = item.lower()
+        blocked = [
+            "python",
+            "script",
+            "function",
+            "import ",
+            "csv",
+            "json",
+            "stdout",
+            "stderr",
+            "artifact",
+            "manifest",
+            "directory",
+            "write ",
+            "read ",
+            "marker",
+            "execution contract",
+            "standalone",
+            "file path",
+        ]
+        if any(token in lowered for token in blocked):
+            return False
+        analysis_terms = [
+            "analyze",
+            "assess",
+            "compare",
+            "contrast",
+            "correlate",
+            "detect",
+            "estimate",
+            "evaluate",
+            "identify",
+            "map",
+            "measure",
+            "model",
+            "quantify",
+            "score",
+            "stratify",
+            "summarize",
+            "test",
+            "validate",
+            "cell",
+            "clone",
+            "clonotype",
+            "gene",
+            "group",
+            "pathway",
+            "patient",
+            "program",
+            "repertoire",
+            "state",
+            "tcr",
+            "tissue",
+        ]
+        return any(term in lowered for term in analysis_terms)
 
     @staticmethod
     def _render_team_summary(responses: list[AgentResponse]) -> str:

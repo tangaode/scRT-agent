@@ -135,8 +135,10 @@ the Hypothesis Review panel is populated with the candidate list and editable
 fields for the selected hypothesis, explanation, required tests, falsification
 criteria and source tables. After the user confirms a hypothesis, the deep-dive
 and downstream plans for that selected hypothesis can be reviewed in the Plan
-Review panel before execution. User feedback is sent back to the planning agent
-so it can revise the plan and script before running.
+Review panel before execution. The panel shows a short numbered list of next
+analyses, while the full generated plan and script remain available as run
+artifacts. User feedback is sent back to the planning agent so it can revise
+the plan and script before running.
 
 For the terminal wizard:
 

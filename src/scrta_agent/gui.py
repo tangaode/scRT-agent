@@ -262,7 +262,7 @@ class ScRTAgentLauncher(tk.Tk):
 
         plan_notebook = ttk.Notebook(plan_review)
         plan_notebook.grid(row=1, column=0, sticky="ew", pady=4)
-        self.plan_review_context_text = self._add_text_tab(plan_notebook, "Generated Plan", height=7)
+        self.plan_review_context_text = self._add_text_tab(plan_notebook, "Next Analyses", height=7)
         self.plan_review_feedback_text = self._add_text_tab(plan_notebook, "Your Changes", height=5)
 
         plan_buttons = ttk.Frame(plan_review)
