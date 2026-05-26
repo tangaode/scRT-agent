@@ -14,7 +14,7 @@ from .deep_dive import DeepDiveSelection
 from .llm import LLMClient
 from .schemas import WorkflowConfig
 from .utils import slugify, utc_timestamp
-from .workflow import ScRTAWorkflow
+from .workflow import HypothesisRegenerationRequested, ScRTAWorkflow
 
 
 SETTINGS_FILE = ".scrta_gui_settings.json"
@@ -240,20 +240,28 @@ class ScRTAgentLauncher(tk.Tk):
         hypothesis_buttons.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         hypothesis_buttons.columnconfigure(0, weight=1)
         hypothesis_buttons.columnconfigure(1, weight=1)
+        hypothesis_buttons.columnconfigure(2, weight=1)
         self.confirm_hypothesis_button = ttk.Button(
             hypothesis_buttons,
             text="Use Selected Hypothesis and Continue",
             command=self._confirm_hypothesis_review,
             state="disabled",
         )
-        self.confirm_hypothesis_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.confirm_hypothesis_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.regenerate_hypothesis_button = ttk.Button(
+            hypothesis_buttons,
+            text="Regenerate Hypotheses",
+            command=self._regenerate_hypotheses,
+            state="disabled",
+        )
+        self.regenerate_hypothesis_button.grid(row=0, column=1, sticky="ew", padx=4)
         self.cancel_hypothesis_button = ttk.Button(
             hypothesis_buttons,
             text="Cancel Hypothesis Selection",
             command=self._cancel_hypothesis_review,
             state="disabled",
         )
-        self.cancel_hypothesis_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self.cancel_hypothesis_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         plan_review = ttk.LabelFrame(right, text="Plan Review / User Feedback", padding=8)
         plan_review.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -512,6 +520,8 @@ class ScRTAgentLauncher(tk.Tk):
         error = holder.get("error")
         if error:
             raise RuntimeError(str(error))
+        if holder.get("regenerate"):
+            raise HypothesisRegenerationRequested("User requested regenerated hypothesis candidates from the GUI.")
         selection = holder.get("selection")
         if not isinstance(selection, DeepDiveSelection):
             raise RuntimeError("No hypothesis was selected.")
@@ -602,6 +612,7 @@ class ScRTAgentLauncher(tk.Tk):
             self.hypothesis_list.insert(tk.END, f"{hyp_id}: {candidate.get('title', '')}")
         self.hypothesis_status_var.set("Select, edit, and confirm one hypothesis")
         self.confirm_hypothesis_button.configure(state="normal")
+        self.regenerate_hypothesis_button.configure(state="normal")
         self.cancel_hypothesis_button.configure(state="normal")
         if self.hypothesis_list.size():
             self.hypothesis_list.selection_set(0)
@@ -610,7 +621,8 @@ class ScRTAgentLauncher(tk.Tk):
             self._load_hypothesis_review_candidate()
         self._append_log(
             "\nHypothesis candidates are ready. Select and edit one in the Hypothesis Review panel, "
-            "then click Use Selected Hypothesis and Continue.\n"
+            "then click Use Selected Hypothesis and Continue. Click Regenerate Hypotheses to ask "
+            "the LLM for a fresh candidate set.\n"
         )
 
     def _load_hypothesis_review_candidate(self, event: object | None = None) -> None:
@@ -668,10 +680,26 @@ class ScRTAgentLauncher(tk.Tk):
         self.hypothesis_selection_holder = None
         self.hypothesis_selection_event = None
         self.confirm_hypothesis_button.configure(state="disabled")
+        self.regenerate_hypothesis_button.configure(state="disabled")
         self.cancel_hypothesis_button.configure(state="disabled")
         self.hypothesis_status_var.set(f"Confirmed {hyp_id}; workflow is continuing")
         self.status_var.set("Running")
         self._append_log(f"\nConfirmed selected hypothesis: {hyp_id}\n")
+
+    def _regenerate_hypotheses(self) -> None:
+        if self.hypothesis_selection_holder is None or self.hypothesis_selection_event is None:
+            messagebox.showinfo("No pending selection", "No hypothesis selection is currently pending.")
+            return
+        self.hypothesis_selection_holder["regenerate"] = True
+        self.hypothesis_selection_event.set()
+        self.hypothesis_selection_holder = None
+        self.hypothesis_selection_event = None
+        self.confirm_hypothesis_button.configure(state="disabled")
+        self.regenerate_hypothesis_button.configure(state="disabled")
+        self.cancel_hypothesis_button.configure(state="disabled")
+        self.hypothesis_status_var.set("Regenerating hypotheses")
+        self.status_var.set("Regenerating hypotheses")
+        self._append_log("\nRegenerating hypothesis candidates with the LLM.\n")
 
     def _cancel_hypothesis_review(self) -> None:
         if self.hypothesis_selection_holder is None or self.hypothesis_selection_event is None:
@@ -681,6 +709,7 @@ class ScRTAgentLauncher(tk.Tk):
         self.hypothesis_selection_holder = None
         self.hypothesis_selection_event = None
         self.confirm_hypothesis_button.configure(state="disabled")
+        self.regenerate_hypothesis_button.configure(state="disabled")
         self.cancel_hypothesis_button.configure(state="disabled")
         self.hypothesis_status_var.set("Selection cancelled")
         self.status_var.set("Stopping")
@@ -700,6 +729,7 @@ class ScRTAgentLauncher(tk.Tk):
         ]:
             self._set_text(widget, "")
         self.confirm_hypothesis_button.configure(state="disabled")
+        self.regenerate_hypothesis_button.configure(state="disabled")
         self.cancel_hypothesis_button.configure(state="disabled")
         self.hypothesis_status_var.set(status)
 

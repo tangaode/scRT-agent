@@ -133,13 +133,14 @@ configuration save/reload, run status, live logs, an interactive Plan Review
 panel and a Hypothesis Review panel. When candidate hypotheses are generated,
 the Hypothesis Review panel is populated with the candidate list and editable
 fields for the selected hypothesis, explanation, required tests, falsification
-criteria and source tables. After the user confirms a hypothesis, the deep-dive
-and downstream plans for that selected hypothesis can be reviewed in the Plan
-Review panel before execution. The panel shows a short numbered list of next
-analyses, while the full generated plan and script remain available as run
-artifacts. User feedback is sent back to the planning agent so it can revise
-the plan before a separate implementation step writes and runs the Python
-script.
+criteria and source tables. The user can confirm one hypothesis or regenerate
+a fresh candidate set before moving on. After the user confirms a hypothesis,
+the deep-dive and downstream plans for that selected hypothesis can be reviewed
+in the Plan Review panel before execution. The panel shows a short numbered
+list of next analyses, while the full generated plan and script remain
+available as run artifacts. User feedback is sent back to the planning agent so
+it can revise the plan before a separate implementation step writes and runs
+the Python script.
 
 For the terminal wizard:
 
@@ -275,7 +276,8 @@ Important options:
 - `--interactive-plan-review`: pause after selected-hypothesis plans so the
   user can add feedback before execution.
 - `--interactive-hypothesis-selection`: pause after hypothesis generation so
-  the user can select and edit the hypothesis before deep-dive analysis.
+  the user can select, edit or regenerate the hypothesis candidates before
+  deep-dive analysis.
 - `--repair-attempts N`: retry script execution after transient failures.
 - `--script-timeout SECONDS`: set script execution timeout.
 - `--rag-index PATH`: inject local RAG chunks into agent prompts.

@@ -40,6 +40,10 @@ HypothesisSelectionCallback = Callable[[dict[str, dict[str, object]]], DeepDiveS
 PlanReviewCallback = Callable[[str], str]
 
 
+class HypothesisRegenerationRequested(Exception):
+    """Raised by an interactive UI when the user asks for new candidates."""
+
+
 class ScRTAWorkflow:
     """Pantheon-inspired fixed workflow for paired scRNA/scTCR analysis."""
 
@@ -590,76 +594,120 @@ class ScRTAWorkflow:
 
         dataset_reconnaissance_context = self._render_dataset_reconnaissance_context(state.run_dir)
 
-        generator_context = dict(base_context)
-        generator_context["dataset_reconnaissance_context"] = dataset_reconnaissance_context
-        generator = self._call_and_store(
-            team,
-            store,
-            state,
-            "hypothesis_generator",
-            (
-                "After reading the RAG evidence and dataset reconnaissance tables, generate "
-                "3-4 novel, biologically meaningful, falsifiable hypotheses for this "
-                "dataset. Do not simply restate a source paper. Do not derive hypotheses "
-                "from earlier team plans or from a fixed CD8/Treg/clone menu; use only the "
-                "retrieved literature, disease context, dataset structure, and executed "
-                "reconnaissance outputs."
-            ),
-            self._context_with_rag(
-                generator_context,
-                rag_chunks,
-                (
-                    "generate novel biology-first hypotheses from RAG literature and current dataset "
-                    "disease context tissue context treatment response resistance immune state programs "
-                    "tumor microenvironment mechanisms paired scRNA scTCR support when relevant"
-                ),
-                store=store,
-                state=state,
-                agent_name="hypothesis_generator",
-            ),
-            artifact_name="rag_grounded_hypothesis_candidates",
-        )
-        responses.append(generator)
-        generated_candidates = extract_hypothesis_candidates(generator.content)
-        if not generated_candidates:
-            error_path = store.write_markdown(
-                "hypothesis_generation_error",
-                (
-                    "# Hypothesis Generation Error\n\n"
-                    "The LLM hypothesis_generator did not emit a parseable "
-                    "`HYPOTHESIS_CANDIDATES_JSON` block. The workflow stops instead "
-                    "of using deterministic fallback hypotheses.\n"
-                ),
+        generation_attempt = 1
+        max_generation_attempts = max(1, int(self.config.analysis_loops or 1))
+        while True:
+            generator_context = dict(base_context)
+            generator_context["dataset_reconnaissance_context"] = dataset_reconnaissance_context
+            if generation_attempt > 1:
+                generator_context["hypothesis_regeneration_request"] = (
+                    "The user rejected the previous candidate set from the GUI and requested "
+                    "new hypotheses. Generate a fresh set with different biological angles. "
+                    "Do not repeat the previous candidate titles or simply reword them."
+                )
+            generator_artifact = (
+                "rag_grounded_hypothesis_candidates"
+                if generation_attempt == 1
+                else f"rag_grounded_hypothesis_candidates_regeneration_{generation_attempt}"
             )
-            self._add_artifact(state, "hypothesis_generation_error", error_path)
-            raise RuntimeError("hypothesis_generator did not emit parseable hypothesis candidates.")
-        candidate_index_path = store.write_json(
-            "hypothesis_candidate_index",
-            {
-                "source": "hypothesis_generator",
-                "candidate_count": len(generated_candidates),
-                "candidate_ids": sorted(generated_candidates),
-                "audit_note": (
-                    "This is only an audit manifest of LLM-generated candidate IDs. "
-                    "It is not a scoring table, not a hard-coded menu, and not a "
-                    "deterministic selection rule."
+            generator = self._call_and_store(
+                team,
+                store,
+                state,
+                "hypothesis_generator",
+                (
+                    "After reading the RAG evidence and dataset reconnaissance tables, generate "
+                    "3-4 novel, biologically meaningful, falsifiable hypotheses for this "
+                    "dataset. Do not simply restate a source paper. Do not derive hypotheses "
+                    "from earlier team plans or from a fixed CD8/Treg/clone menu; use only the "
+                    "retrieved literature, disease context, dataset structure, and executed "
+                    "reconnaissance outputs."
                 ),
-            },
-        )
-        self._add_artifact(state, "hypothesis_candidate_index", candidate_index_path)
+                self._context_with_rag(
+                    generator_context,
+                    rag_chunks,
+                    (
+                        "generate novel biology-first hypotheses from RAG literature and current dataset "
+                        "disease context tissue context treatment response resistance immune state programs "
+                        "tumor microenvironment mechanisms paired scRNA scTCR support when relevant"
+                    ),
+                    store=store,
+                    state=state,
+                    agent_name=generator_artifact,
+                ),
+                artifact_name=generator_artifact,
+            )
+            responses.append(generator)
+            generated_candidates = extract_hypothesis_candidates(generator.content)
+            if not generated_candidates:
+                error_path = store.write_markdown(
+                    "hypothesis_generation_error",
+                    (
+                        "# Hypothesis Generation Error\n\n"
+                        "The LLM hypothesis_generator did not emit a parseable "
+                        "`HYPOTHESIS_CANDIDATES_JSON` block. The workflow stops instead "
+                        "of using deterministic fallback hypotheses.\n"
+                    ),
+                )
+                self._add_artifact(state, "hypothesis_generation_error", error_path)
+                raise RuntimeError("hypothesis_generator did not emit parseable hypothesis candidates.")
+            candidate_index_name = (
+                "hypothesis_candidate_index"
+                if generation_attempt == 1
+                else f"hypothesis_candidate_index_regeneration_{generation_attempt}"
+            )
+            candidate_index_path = store.write_json(
+                candidate_index_name,
+                {
+                    "source": generator_artifact,
+                    "generation_attempt": generation_attempt,
+                    "candidate_count": len(generated_candidates),
+                    "candidate_ids": sorted(generated_candidates),
+                    "audit_note": (
+                        "This is only an audit manifest of LLM-generated candidate IDs. "
+                        "It is not a scoring table, not a hard-coded menu, and not a "
+                        "deterministic selection rule."
+                    ),
+                },
+            )
+            self._add_artifact(state, candidate_index_name, candidate_index_path)
 
-        if self.config.interactive_hypothesis_selection:
-            selection, selector_response = self._select_hypothesis_interactively(
-                generated_candidates=generated_candidates,
-                store=store,
-                state=state,
-            )
-            responses.append(selector_response)
-            selector_review_content = selector_response.content
-        else:
+            if self.config.interactive_hypothesis_selection:
+                try:
+                    selection, selector_response = self._select_hypothesis_interactively(
+                        generated_candidates=generated_candidates,
+                        store=store,
+                        state=state,
+                    )
+                except HypothesisRegenerationRequested as exc:
+                    response = AgentResponse(
+                        agent_name="interactive_hypothesis_regeneration",
+                        content=(
+                            "# Interactive Hypothesis Regeneration\n\n"
+                            f"- Rejected generation attempt: {generation_attempt}\n"
+                            f"- Reason: {exc}\n"
+                        ),
+                        metadata={"mode": "interactive", "role": "human_hypothesis_regeneration"},
+                    )
+                    responses.append(response)
+                    path = store.write_markdown(
+                        f"interactive_hypothesis_regeneration_{generation_attempt}",
+                        response.content,
+                    )
+                    self._add_artifact(state, f"interactive_hypothesis_regeneration_{generation_attempt}", path)
+                    generation_attempt += 1
+                    if generation_attempt > max_generation_attempts:
+                        raise RuntimeError(
+                            "Hypothesis regeneration limit was reached before a hypothesis was selected."
+                        )
+                    continue
+                responses.append(selector_response)
+                selector_review_content = selector_response.content
+                break
+
             deep_context = dict(base_context)
             compact_candidates = {
-                "source": "hypothesis_generator",
+                "source": generator_artifact,
                 "selection_instruction": (
                     "Select exactly one ID from this JSON. Preserve the selected "
                     "candidate's hypothesis_statement and plain_language_explanation."
@@ -680,8 +728,6 @@ class ScRTAWorkflow:
                     for hyp_id, candidate in sorted(generated_candidates.items())
                 ],
             }
-            # Put the compact candidate block under an early-sorting key so the
-            # selector sees it even when large reconnaissance context is truncated.
             deep_context["aa_hypothesis_candidates_for_selection"] = json.dumps(
                 compact_candidates,
                 ensure_ascii=False,
@@ -742,9 +788,9 @@ class ScRTAWorkflow:
                 "If the selector output is malformed, the workflow fails rather than selecting "
                 "a deterministic fallback candidate."
             )
-            selection_payload["llm_hypothesis_generator_artifact"] = "rag_grounded_hypothesis_candidates.md"
+            selection_payload["llm_hypothesis_generator_artifact"] = generator_artifact + ".md"
             selection_payload["llm_selector_artifact"] = "agent_hypothesis_selector.md"
-            selection_payload["candidate_index_artifact"] = "hypothesis_candidate_index.json"
+            selection_payload["candidate_index_artifact"] = str(Path(candidate_index_path).name)
             selection_json = store.write_json("selected_hypothesis", selection_payload)
             selection_md_text = (
                 selection.to_markdown()
@@ -762,6 +808,7 @@ class ScRTAWorkflow:
             selection_md = store.write_markdown("selected_hypothesis", selection_md_text)
             self._add_artifact(state, "selected_hypothesis_json", selection_json)
             self._add_artifact(state, "selected_hypothesis", selection_md)
+            break
 
         planner_context = dict(base_context)
         planner_context["selected_hypothesis"] = selection.to_markdown()
