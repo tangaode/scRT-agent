@@ -27,7 +27,6 @@ from scrta_agent.script_writer import (
     render_joint_analysis_script,
     render_publication_figure_script,
 )
-from scrta_agent.workflow import ScRTAWorkflow
 
 
 def test_fixed_team_has_expected_roles() -> None:
@@ -277,44 +276,6 @@ def test_h5ad_under_tcr_named_parent_is_valid_rna_input(tmp_path: Path) -> None:
 
     assert sources == [h5ad.resolve()]
     assert folder_sources == [h5ad.resolve()]
-
-
-def test_plan_review_display_omits_truncated_execution_prose() -> None:
-    plan_text = """
-Short deep-dive plan: I will implement a hypothesis-specific validator that first reads the selected
-hypothesis text and then searches the existing analysis outputs for the exact metadata, state labels,
-and signatures needed to test the claim in a generated Python script.
-
-DEEP_DIVE_PYTHON_SCRIPT
-print("placeholder")
-END_DEEP_DIVE_PYTHON_SCRIPT
-"""
-
-    display = ScRTAWorkflow._render_plan_review_display("Deep-Dive", plan_text)
-
-    assert "[truncated]" not in display
-    assert "Short deep-dive plan" not in display
-    assert "I will implement" not in display
-    assert "Python script" not in display
-    assert "Review the selected hypothesis" in display
-
-
-def test_plan_review_display_prefers_explicit_summary_block() -> None:
-    plan_text = """
-PLAN_REVIEW_SUMMARY
-1. Identify recurrent clonotypes that appear in at least two timepoints within the same patient.
-2. Compare cytotoxic program scores between recurrent and non-recurrent clonotypes.
-3. Test whether recurrent clonotypes remain enriched in the same cytotoxic effector T-cell state.
-END_PLAN_REVIEW_SUMMARY
-
-Detailed plan text and implementation notes can be longer here.
-"""
-
-    display = ScRTAWorkflow._render_plan_review_display("Deep-Dive", plan_text)
-
-    assert "Identify recurrent clonotypes" in display
-    assert "Compare cytotoxic program scores" in display
-    assert "Detailed plan text" not in display
 
 
 def test_llm_client_loads_root_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

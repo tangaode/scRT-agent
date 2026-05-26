@@ -14,7 +14,7 @@ from .deep_dive import DeepDiveSelection
 from .llm import LLMClient
 from .schemas import WorkflowConfig
 from .utils import slugify, utc_timestamp
-from .workflow import HypothesisRegenerationRequested, ScRTAWorkflow
+from .workflow import ScRTAWorkflow
 
 
 SETTINGS_FILE = ".scrta_gui_settings.json"
@@ -57,18 +57,14 @@ class ScRTAgentLauncher(tk.Tk):
         self.status_var = tk.StringVar(value="Ready")
         self.last_run_dir_var = tk.StringVar()
         self.command_preview_var = tk.StringVar()
-        self.plan_review_status_var = tk.StringVar(value="Waiting for selected-hypothesis plan")
         self.hypothesis_status_var = tk.StringVar(value="Waiting for generated candidates")
         self.hypothesis_title_var = tk.StringVar()
-        self.plan_review_holder: dict[str, object] | None = None
-        self.plan_review_event: threading.Event | None = None
         self.current_hypothesis_candidates: dict[str, dict[str, object]] = {}
         self.hypothesis_selection_holder: dict[str, object] | None = None
         self.hypothesis_selection_event: threading.Event | None = None
 
         self.execute_var = tk.BooleanVar(value=True)
         self.input_prep_llm_var = tk.BooleanVar(value=True)
-        self.interactive_plan_review_var = tk.BooleanVar(value=True)
         self.interactive_selection_var = tk.BooleanVar(value=True)
         self.deep_dive_var = tk.BooleanVar(value=True)
         self.mechanism_var = tk.BooleanVar(value=True)
@@ -91,7 +87,7 @@ class ScRTAgentLauncher(tk.Tk):
         right = ttk.Frame(self, padding=8)
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(1, weight=1)
-        right.rowconfigure(3, weight=1)
+        right.rowconfigure(2, weight=1)
 
         config = ttk.LabelFrame(left, text="Run Configuration", padding=8)
         config.grid(row=0, column=0, sticky="nsew")
@@ -175,11 +171,10 @@ class ScRTAgentLauncher(tk.Tk):
             loops.columnconfigure(idx, weight=1)
         ttk.Checkbutton(loops, text="Prepare inputs with LLM", variable=self.input_prep_llm_var).grid(row=0, column=0, sticky="w", pady=4)
         ttk.Checkbutton(loops, text="Execute scripts", variable=self.execute_var).grid(row=0, column=1, sticky="w", pady=4)
-        ttk.Checkbutton(loops, text="Interactive plan review", variable=self.interactive_plan_review_var).grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Checkbutton(loops, text="Interactive hypothesis selection", variable=self.interactive_selection_var).grid(row=1, column=1, sticky="w", pady=4)
-        ttk.Checkbutton(loops, text="Deep-dive loop", variable=self.deep_dive_var).grid(row=2, column=0, sticky="w", pady=4)
-        ttk.Checkbutton(loops, text="Mechanism loop", variable=self.mechanism_var).grid(row=2, column=1, sticky="w", pady=4)
-        ttk.Checkbutton(loops, text="Downstream loop", variable=self.downstream_var).grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Checkbutton(loops, text="Interactive hypothesis selection", variable=self.interactive_selection_var).grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Checkbutton(loops, text="Deep-dive loop", variable=self.deep_dive_var).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Checkbutton(loops, text="Mechanism loop", variable=self.mechanism_var).grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Checkbutton(loops, text="Downstream loop", variable=self.downstream_var).grid(row=2, column=1, sticky="w", pady=4)
 
         actions = ttk.LabelFrame(left, text="Actions", padding=8)
         actions.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -240,63 +235,26 @@ class ScRTAgentLauncher(tk.Tk):
         hypothesis_buttons.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         hypothesis_buttons.columnconfigure(0, weight=1)
         hypothesis_buttons.columnconfigure(1, weight=1)
-        hypothesis_buttons.columnconfigure(2, weight=1)
         self.confirm_hypothesis_button = ttk.Button(
             hypothesis_buttons,
             text="Use Selected Hypothesis and Continue",
             command=self._confirm_hypothesis_review,
             state="disabled",
         )
-        self.confirm_hypothesis_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.regenerate_hypothesis_button = ttk.Button(
-            hypothesis_buttons,
-            text="Regenerate Hypotheses",
-            command=self._regenerate_hypotheses,
-            state="disabled",
-        )
-        self.regenerate_hypothesis_button.grid(row=0, column=1, sticky="ew", padx=4)
+        self.confirm_hypothesis_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.cancel_hypothesis_button = ttk.Button(
             hypothesis_buttons,
             text="Cancel Hypothesis Selection",
             command=self._cancel_hypothesis_review,
             state="disabled",
         )
-        self.cancel_hypothesis_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
-
-        plan_review = ttk.LabelFrame(right, text="Plan Review / User Feedback", padding=8)
-        plan_review.grid(row=2, column=0, sticky="ew", pady=(12, 0))
-        plan_review.columnconfigure(0, weight=1)
-        ttk.Label(plan_review, textvariable=self.plan_review_status_var).grid(row=0, column=0, sticky="w", pady=4)
-
-        plan_notebook = ttk.Notebook(plan_review)
-        plan_notebook.grid(row=1, column=0, sticky="ew", pady=4)
-        self.plan_review_context_text = self._add_text_tab(plan_notebook, "Next Analyses", height=7)
-        self.plan_review_feedback_text = self._add_text_tab(plan_notebook, "Your Changes", height=5)
-
-        plan_buttons = ttk.Frame(plan_review)
-        plan_buttons.grid(row=2, column=0, sticky="ew", pady=(6, 0))
-        plan_buttons.columnconfigure(0, weight=1)
-        plan_buttons.columnconfigure(1, weight=1)
-        self.confirm_plan_button = ttk.Button(
-            plan_buttons,
-            text="Approve Plan and Continue",
-            command=self._confirm_plan_review,
-            state="disabled",
-        )
-        self.confirm_plan_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.cancel_plan_button = ttk.Button(
-            plan_buttons,
-            text="Cancel Plan Review",
-            command=self._cancel_plan_review,
-            state="disabled",
-        )
-        self.cancel_plan_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self.cancel_hypothesis_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
         log_frame = ttk.LabelFrame(right, text="Execution Log", padding=8)
-        log_frame.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
+        log_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        self.log_text = tk.Text(log_frame, wrap="word", height=18)
+        self.log_text = tk.Text(log_frame, wrap="word", height=30)
         self.log_text.grid(row=0, column=0, sticky="nsew")
         log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         log_scroll.grid(row=0, column=1, sticky="ns")
@@ -406,7 +364,6 @@ class ScRTAgentLauncher(tk.Tk):
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.status_var.set("Running")
-        self._reset_plan_review("Waiting for selected-hypothesis plan")
         self._reset_hypothesis_review("Waiting for generated candidates")
         self.log_text.delete("1.0", tk.END)
         self._update_command_preview()
@@ -487,13 +444,11 @@ class ScRTAgentLauncher(tk.Tk):
                     mechanism_loop_enabled=bool(settings["mechanism"]),
                     downstream_analysis_enabled=bool(settings["downstream"]),
                     interactive_hypothesis_selection=bool(settings["interactive_selection"]),
-                    interactive_plan_review=bool(settings["interactive_plan_review"]),
                 )
                 workflow = ScRTAWorkflow(
                     config,
                     llm=llm,
                     hypothesis_selection_callback=self._request_hypothesis_selection,
-                    plan_review_callback=self._request_plan_review,
                 )
                 state = workflow.run()
                 self.message_queue.put(("run_complete", str(state.run_dir)))
@@ -501,16 +456,6 @@ class ScRTAgentLauncher(tk.Tk):
             self.message_queue.put(("run_error", f"Run failed before completion.\n\n{exc}\n"))
         except Exception:
             self.message_queue.put(("run_error", traceback.format_exc()))
-
-    def _request_plan_review(self, plan_context: str) -> str:
-        holder: dict[str, object] = {}
-        event = threading.Event()
-        self.message_queue.put(("plan_review", plan_context, holder, event))
-        event.wait()
-        error = holder.get("error")
-        if error:
-            raise RuntimeError(str(error))
-        return str(holder.get("feedback", ""))
 
     def _request_hypothesis_selection(self, candidates: dict[str, dict[str, object]]) -> DeepDiveSelection:
         holder: dict[str, object] = {}
@@ -520,8 +465,6 @@ class ScRTAgentLauncher(tk.Tk):
         error = holder.get("error")
         if error:
             raise RuntimeError(str(error))
-        if holder.get("regenerate"):
-            raise HypothesisRegenerationRequested("User requested regenerated hypothesis candidates from the GUI.")
         selection = holder.get("selection")
         if not isinstance(selection, DeepDiveSelection):
             raise RuntimeError("No hypothesis was selected.")
@@ -541,63 +484,6 @@ class ScRTAgentLauncher(tk.Tk):
             holder["selection"] = dialog.selection
         event.set()
 
-    def _populate_plan_review(
-        self,
-        plan_context: str,
-        holder: dict[str, object],
-        event: threading.Event,
-    ) -> None:
-        self.plan_review_holder = holder
-        self.plan_review_event = event
-        self._set_text(self.plan_review_context_text, plan_context)
-        self._set_text(self.plan_review_feedback_text, "")
-        self.plan_review_status_var.set("Review the selected-hypothesis plan, add changes, then continue")
-        self.confirm_plan_button.configure(state="normal")
-        self.cancel_plan_button.configure(state="normal")
-        self._append_log(
-            "\nA selected-hypothesis plan is ready. Add requested plan changes in the Plan Review panel, "
-            "then click Approve Plan and Continue.\n"
-        )
-
-    def _confirm_plan_review(self) -> None:
-        if self.plan_review_holder is None or self.plan_review_event is None:
-            messagebox.showinfo("No pending plan review", "No plan review is currently pending.")
-            return
-        feedback = self._get_text(self.plan_review_feedback_text)
-        self.plan_review_holder["feedback"] = feedback
-        self.plan_review_event.set()
-        self.plan_review_holder = None
-        self.plan_review_event = None
-        self.confirm_plan_button.configure(state="disabled")
-        self.cancel_plan_button.configure(state="disabled")
-        self.plan_review_status_var.set("Plan review confirmed; workflow is continuing")
-        self.status_var.set("Running")
-        if feedback:
-            self._append_log("\nPlan feedback submitted. The planning agent will revise the plan and script before execution.\n")
-        else:
-            self._append_log("\nPlan approved without additional changes.\n")
-
-    def _cancel_plan_review(self) -> None:
-        if self.plan_review_holder is None or self.plan_review_event is None:
-            return
-        self.plan_review_holder["error"] = "Plan review was cancelled."
-        self.plan_review_event.set()
-        self.plan_review_holder = None
-        self.plan_review_event = None
-        self.confirm_plan_button.configure(state="disabled")
-        self.cancel_plan_button.configure(state="disabled")
-        self.plan_review_status_var.set("Plan review cancelled")
-        self.status_var.set("Stopping")
-
-    def _reset_plan_review(self, status: str) -> None:
-        self.plan_review_holder = None
-        self.plan_review_event = None
-        self._set_text(self.plan_review_context_text, "")
-        self._set_text(self.plan_review_feedback_text, "")
-        self.confirm_plan_button.configure(state="disabled")
-        self.cancel_plan_button.configure(state="disabled")
-        self.plan_review_status_var.set(status)
-
     def _populate_hypothesis_review(
         self,
         candidates: dict[str, dict[str, object]],
@@ -612,7 +498,6 @@ class ScRTAgentLauncher(tk.Tk):
             self.hypothesis_list.insert(tk.END, f"{hyp_id}: {candidate.get('title', '')}")
         self.hypothesis_status_var.set("Select, edit, and confirm one hypothesis")
         self.confirm_hypothesis_button.configure(state="normal")
-        self.regenerate_hypothesis_button.configure(state="normal")
         self.cancel_hypothesis_button.configure(state="normal")
         if self.hypothesis_list.size():
             self.hypothesis_list.selection_set(0)
@@ -621,8 +506,7 @@ class ScRTAgentLauncher(tk.Tk):
             self._load_hypothesis_review_candidate()
         self._append_log(
             "\nHypothesis candidates are ready. Select and edit one in the Hypothesis Review panel, "
-            "then click Use Selected Hypothesis and Continue. Click Regenerate Hypotheses to ask "
-            "the LLM for a fresh candidate set.\n"
+            "then click Use Selected Hypothesis and Continue.\n"
         )
 
     def _load_hypothesis_review_candidate(self, event: object | None = None) -> None:
@@ -680,26 +564,10 @@ class ScRTAgentLauncher(tk.Tk):
         self.hypothesis_selection_holder = None
         self.hypothesis_selection_event = None
         self.confirm_hypothesis_button.configure(state="disabled")
-        self.regenerate_hypothesis_button.configure(state="disabled")
         self.cancel_hypothesis_button.configure(state="disabled")
         self.hypothesis_status_var.set(f"Confirmed {hyp_id}; workflow is continuing")
         self.status_var.set("Running")
         self._append_log(f"\nConfirmed selected hypothesis: {hyp_id}\n")
-
-    def _regenerate_hypotheses(self) -> None:
-        if self.hypothesis_selection_holder is None or self.hypothesis_selection_event is None:
-            messagebox.showinfo("No pending selection", "No hypothesis selection is currently pending.")
-            return
-        self.hypothesis_selection_holder["regenerate"] = True
-        self.hypothesis_selection_event.set()
-        self.hypothesis_selection_holder = None
-        self.hypothesis_selection_event = None
-        self.confirm_hypothesis_button.configure(state="disabled")
-        self.regenerate_hypothesis_button.configure(state="disabled")
-        self.cancel_hypothesis_button.configure(state="disabled")
-        self.hypothesis_status_var.set("Regenerating hypotheses")
-        self.status_var.set("Regenerating hypotheses")
-        self._append_log("\nRegenerating hypothesis candidates with the LLM.\n")
 
     def _cancel_hypothesis_review(self) -> None:
         if self.hypothesis_selection_holder is None or self.hypothesis_selection_event is None:
@@ -709,7 +577,6 @@ class ScRTAgentLauncher(tk.Tk):
         self.hypothesis_selection_holder = None
         self.hypothesis_selection_event = None
         self.confirm_hypothesis_button.configure(state="disabled")
-        self.regenerate_hypothesis_button.configure(state="disabled")
         self.cancel_hypothesis_button.configure(state="disabled")
         self.hypothesis_status_var.set("Selection cancelled")
         self.status_var.set("Stopping")
@@ -729,7 +596,6 @@ class ScRTAgentLauncher(tk.Tk):
         ]:
             self._set_text(widget, "")
         self.confirm_hypothesis_button.configure(state="disabled")
-        self.regenerate_hypothesis_button.configure(state="disabled")
         self.cancel_hypothesis_button.configure(state="disabled")
         self.hypothesis_status_var.set(status)
 
@@ -758,10 +624,6 @@ class ScRTAgentLauncher(tk.Tk):
                     _, candidates, holder, event = message
                     self.status_var.set("Waiting for hypothesis selection")
                     self._populate_hypothesis_review(candidates, holder, event)
-                elif kind == "plan_review":
-                    _, plan_context, holder, event = message
-                    self.status_var.set("Waiting for plan review")
-                    self._populate_plan_review(plan_context, holder, event)
                 elif kind == "run_complete":
                     self.status_var.set("Finished")
                     self.last_run_dir_var.set(message[1])
@@ -812,7 +674,6 @@ class ScRTAgentLauncher(tk.Tk):
             "script_timeout": self.script_timeout_var.get().strip() or "7200",
             "execute": self.execute_var.get(),
             "input_prep_llm": self.input_prep_llm_var.get(),
-            "interactive_plan_review": self.interactive_plan_review_var.get(),
             "interactive_selection": self.interactive_selection_var.get(),
             "deep_dive": self.deep_dive_var.get(),
             "mechanism": self.mechanism_var.get(),
@@ -832,7 +693,6 @@ class ScRTAgentLauncher(tk.Tk):
         self.script_timeout_var.set(str(settings.get("script_timeout", "7200")))
         self.execute_var.set(bool(settings.get("execute", True)))
         self.input_prep_llm_var.set(bool(settings.get("input_prep_llm", True)))
-        self.interactive_plan_review_var.set(bool(settings.get("interactive_plan_review", True)))
         self.interactive_selection_var.set(bool(settings.get("interactive_selection", True)))
         self.deep_dive_var.set(bool(settings.get("deep_dive", True)))
         self.mechanism_var.set(bool(settings.get("mechanism", True)))
@@ -879,8 +739,6 @@ class ScRTAgentLauncher(tk.Tk):
         ]
         if self.execute_var.get():
             command.append("--execute")
-        if self.interactive_plan_review_var.get():
-            command.append("--interactive-plan-review")
         if self.interactive_selection_var.get():
             command.append("--interactive-hypothesis-selection")
         self.command_preview_var.set(" ".join(command))

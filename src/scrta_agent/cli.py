@@ -41,11 +41,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="pause after hypothesis generation so the user can select and edit the hypothesis",
     )
-    run.add_argument(
-        "--interactive-plan-review",
-        action="store_true",
-        help="pause after selected-hypothesis plans so the user can add feedback before execution",
-    )
     run.add_argument("--no-deep-dive", dest="deep_dive_enabled", action="store_false", help="disable hypothesis deep-dive loop")
     run.add_argument(
         "--no-mechanism-loop",
@@ -157,8 +152,6 @@ def _build_config(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     data["use_llm"] = True
     if args.interactive_hypothesis_selection:
         data["interactive_hypothesis_selection"] = True
-    if args.interactive_plan_review:
-        data["interactive_plan_review"] = True
     if args.deep_dive_enabled is False:
         data["deep_dive_enabled"] = False
     if args.mechanism_loop_enabled is False:

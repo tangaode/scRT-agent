@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import asdict
 import json
 from pathlib import Path
-import re
 import shutil
 from typing import Callable
 
@@ -37,11 +36,6 @@ from .utils import ensure_dir, read_text, slugify, truncate_text, utc_timestamp
 
 
 HypothesisSelectionCallback = Callable[[dict[str, dict[str, object]]], DeepDiveSelection]
-PlanReviewCallback = Callable[[str], str]
-
-
-class HypothesisRegenerationRequested(Exception):
-    """Raised by an interactive UI when the user asks for new candidates."""
 
 
 class ScRTAWorkflow:
@@ -52,12 +46,10 @@ class ScRTAWorkflow:
         config: WorkflowConfig,
         llm: LLMClient | None = None,
         hypothesis_selection_callback: HypothesisSelectionCallback | None = None,
-        plan_review_callback: PlanReviewCallback | None = None,
     ) -> None:
         self.config = config
         self.llm = llm or LLMClient(model=config.model, use_llm=config.use_llm)
         self.hypothesis_selection_callback = hypothesis_selection_callback
-        self.plan_review_callback = plan_review_callback
 
     def run(self) -> WorkflowState:
         self.config.use_llm = True
@@ -503,77 +495,6 @@ class ScRTAWorkflow:
         store.event("finish", {"summary": f"finished {self.config.analysis_name}"})
         return state
 
-    def _run_agent_plan_review(
-        self,
-        team: ScRTATeam,
-        store: ArtifactStore,
-        state: WorkflowState,
-        stage: str,
-        plan_text: str,
-        revision_agent_name: str,
-        revision_instruction: str,
-        revision_context: dict,
-        rag_chunks: list,
-        rag_query: str,
-        artifact_prefix: str,
-    ) -> tuple[AgentResponse, list[AgentResponse]]:
-        full_plan_path = store.write_markdown(f"{artifact_prefix}_full_plan_for_review", plan_text.strip() + "\n")
-        self._add_artifact(state, f"{artifact_prefix}_full_plan_for_review", full_plan_path)
-
-        plan_context = self._render_plan_review_display(stage, plan_text)
-        context_path = store.write_markdown(f"{artifact_prefix}_interactive_plan_review_context", plan_context)
-        self._add_artifact(state, f"{artifact_prefix}_interactive_plan_review_context", context_path)
-
-        if self.plan_review_callback is not None:
-            raw_feedback = self.plan_review_callback(plan_context)
-        else:
-            raw_feedback = self._collect_plan_feedback_in_console(plan_context)
-        feedback = raw_feedback.strip()
-        if not feedback:
-            feedback = f"The user approved the {stage} plan without additional changes."
-
-        feedback_response = AgentResponse(
-            agent_name="interactive_plan_feedback",
-            content=f"# Interactive {stage} Plan Feedback\n\n" + feedback + "\n",
-            metadata={"mode": "interactive", "role": "human_plan_feedback", "stage": stage},
-        )
-        feedback_path = store.write_markdown(f"{artifact_prefix}_interactive_plan_feedback", feedback_response.content)
-        self._add_artifact(state, f"{artifact_prefix}_interactive_plan_feedback", feedback_path)
-        feedback_meta_path = store.write_json(
-            f"{artifact_prefix}_interactive_plan_feedback_metadata",
-            asdict(feedback_response),
-        )
-        self._add_artifact(state, f"{artifact_prefix}_interactive_plan_feedback_metadata", feedback_meta_path)
-
-        if feedback == f"The user approved the {stage} plan without additional changes.":
-            return AgentResponse(
-                agent_name=revision_agent_name,
-                content=plan_text,
-                metadata={"mode": "llm", "role": f"{stage}_approved_plan"},
-            ), [feedback_response]
-
-        revision_context = dict(revision_context)
-        revision_context["interactive_plan_review_context"] = plan_context
-        revision_context["interactive_plan_feedback"] = feedback
-        revision_context["original_full_plan_for_review"] = plan_text
-        revised_plan = self._call_and_store(
-            team,
-            store,
-            state,
-            revision_agent_name,
-            revision_instruction,
-            self._context_with_rag(
-                revision_context,
-                rag_chunks,
-                rag_query,
-                store=store,
-                state=state,
-                agent_name=f"{artifact_prefix}_plan_revision",
-            ),
-            artifact_name=f"{artifact_prefix}_agent_plan_revision",
-        )
-        return revised_plan, [feedback_response, revised_plan]
-
     def _run_deep_dive_loop(
         self,
         team: ScRTATeam,
@@ -594,120 +515,76 @@ class ScRTAWorkflow:
 
         dataset_reconnaissance_context = self._render_dataset_reconnaissance_context(state.run_dir)
 
-        generation_attempt = 1
-        max_generation_attempts = max(1, int(self.config.analysis_loops or 1))
-        while True:
-            generator_context = dict(base_context)
-            generator_context["dataset_reconnaissance_context"] = dataset_reconnaissance_context
-            if generation_attempt > 1:
-                generator_context["hypothesis_regeneration_request"] = (
-                    "The user rejected the previous candidate set from the GUI and requested "
-                    "new hypotheses. Generate a fresh set with different biological angles. "
-                    "Do not repeat the previous candidate titles or simply reword them."
-                )
-            generator_artifact = (
-                "rag_grounded_hypothesis_candidates"
-                if generation_attempt == 1
-                else f"rag_grounded_hypothesis_candidates_regeneration_{generation_attempt}"
-            )
-            generator = self._call_and_store(
-                team,
-                store,
-                state,
-                "hypothesis_generator",
+        generator_context = dict(base_context)
+        generator_context["dataset_reconnaissance_context"] = dataset_reconnaissance_context
+        generator = self._call_and_store(
+            team,
+            store,
+            state,
+            "hypothesis_generator",
+            (
+                "After reading the RAG evidence and dataset reconnaissance tables, generate "
+                "3-4 novel, biologically meaningful, falsifiable hypotheses for this "
+                "dataset. Do not simply restate a source paper. Do not derive hypotheses "
+                "from earlier team plans or from a fixed CD8/Treg/clone menu; use only the "
+                "retrieved literature, disease context, dataset structure, and executed "
+                "reconnaissance outputs."
+            ),
+            self._context_with_rag(
+                generator_context,
+                rag_chunks,
                 (
-                    "After reading the RAG evidence and dataset reconnaissance tables, generate "
-                    "3-4 novel, biologically meaningful, falsifiable hypotheses for this "
-                    "dataset. Do not simply restate a source paper. Do not derive hypotheses "
-                    "from earlier team plans or from a fixed CD8/Treg/clone menu; use only the "
-                    "retrieved literature, disease context, dataset structure, and executed "
-                    "reconnaissance outputs."
+                    "generate novel biology-first hypotheses from RAG literature and current dataset "
+                    "disease context tissue context treatment response resistance immune state programs "
+                    "tumor microenvironment mechanisms paired scRNA scTCR support when relevant"
                 ),
-                self._context_with_rag(
-                    generator_context,
-                    rag_chunks,
-                    (
-                        "generate novel biology-first hypotheses from RAG literature and current dataset "
-                        "disease context tissue context treatment response resistance immune state programs "
-                        "tumor microenvironment mechanisms paired scRNA scTCR support when relevant"
-                    ),
-                    store=store,
-                    state=state,
-                    agent_name=generator_artifact,
+                store=store,
+                state=state,
+                agent_name="hypothesis_generator",
+            ),
+            artifact_name="rag_grounded_hypothesis_candidates",
+        )
+        responses.append(generator)
+        generated_candidates = extract_hypothesis_candidates(generator.content)
+        if not generated_candidates:
+            error_path = store.write_markdown(
+                "hypothesis_generation_error",
+                (
+                    "# Hypothesis Generation Error\n\n"
+                    "The LLM hypothesis_generator did not emit a parseable "
+                    "`HYPOTHESIS_CANDIDATES_JSON` block. The workflow stops instead "
+                    "of using deterministic fallback hypotheses.\n"
                 ),
-                artifact_name=generator_artifact,
             )
-            responses.append(generator)
-            generated_candidates = extract_hypothesis_candidates(generator.content)
-            if not generated_candidates:
-                error_path = store.write_markdown(
-                    "hypothesis_generation_error",
-                    (
-                        "# Hypothesis Generation Error\n\n"
-                        "The LLM hypothesis_generator did not emit a parseable "
-                        "`HYPOTHESIS_CANDIDATES_JSON` block. The workflow stops instead "
-                        "of using deterministic fallback hypotheses.\n"
-                    ),
-                )
-                self._add_artifact(state, "hypothesis_generation_error", error_path)
-                raise RuntimeError("hypothesis_generator did not emit parseable hypothesis candidates.")
-            candidate_index_name = (
-                "hypothesis_candidate_index"
-                if generation_attempt == 1
-                else f"hypothesis_candidate_index_regeneration_{generation_attempt}"
-            )
-            candidate_index_path = store.write_json(
-                candidate_index_name,
-                {
-                    "source": generator_artifact,
-                    "generation_attempt": generation_attempt,
-                    "candidate_count": len(generated_candidates),
-                    "candidate_ids": sorted(generated_candidates),
-                    "audit_note": (
-                        "This is only an audit manifest of LLM-generated candidate IDs. "
-                        "It is not a scoring table, not a hard-coded menu, and not a "
-                        "deterministic selection rule."
-                    ),
-                },
-            )
-            self._add_artifact(state, candidate_index_name, candidate_index_path)
+            self._add_artifact(state, "hypothesis_generation_error", error_path)
+            raise RuntimeError("hypothesis_generator did not emit parseable hypothesis candidates.")
+        candidate_index_path = store.write_json(
+            "hypothesis_candidate_index",
+            {
+                "source": "hypothesis_generator",
+                "candidate_count": len(generated_candidates),
+                "candidate_ids": sorted(generated_candidates),
+                "audit_note": (
+                    "This is only an audit manifest of LLM-generated candidate IDs. "
+                    "It is not a scoring table, not a hard-coded menu, and not a "
+                    "deterministic selection rule."
+                ),
+            },
+        )
+        self._add_artifact(state, "hypothesis_candidate_index", candidate_index_path)
 
-            if self.config.interactive_hypothesis_selection:
-                try:
-                    selection, selector_response = self._select_hypothesis_interactively(
-                        generated_candidates=generated_candidates,
-                        store=store,
-                        state=state,
-                    )
-                except HypothesisRegenerationRequested as exc:
-                    response = AgentResponse(
-                        agent_name="interactive_hypothesis_regeneration",
-                        content=(
-                            "# Interactive Hypothesis Regeneration\n\n"
-                            f"- Rejected generation attempt: {generation_attempt}\n"
-                            f"- Reason: {exc}\n"
-                        ),
-                        metadata={"mode": "interactive", "role": "human_hypothesis_regeneration"},
-                    )
-                    responses.append(response)
-                    path = store.write_markdown(
-                        f"interactive_hypothesis_regeneration_{generation_attempt}",
-                        response.content,
-                    )
-                    self._add_artifact(state, f"interactive_hypothesis_regeneration_{generation_attempt}", path)
-                    generation_attempt += 1
-                    if generation_attempt > max_generation_attempts:
-                        raise RuntimeError(
-                            "Hypothesis regeneration limit was reached before a hypothesis was selected."
-                        )
-                    continue
-                responses.append(selector_response)
-                selector_review_content = selector_response.content
-                break
-
+        if self.config.interactive_hypothesis_selection:
+            selection, selector_response = self._select_hypothesis_interactively(
+                generated_candidates=generated_candidates,
+                store=store,
+                state=state,
+            )
+            responses.append(selector_response)
+            selector_review_content = selector_response.content
+        else:
             deep_context = dict(base_context)
             compact_candidates = {
-                "source": generator_artifact,
+                "source": "hypothesis_generator",
                 "selection_instruction": (
                     "Select exactly one ID from this JSON. Preserve the selected "
                     "candidate's hypothesis_statement and plain_language_explanation."
@@ -728,6 +605,8 @@ class ScRTAWorkflow:
                     for hyp_id, candidate in sorted(generated_candidates.items())
                 ],
             }
+            # Put the compact candidate block under an early-sorting key so the
+            # selector sees it even when large reconnaissance context is truncated.
             deep_context["aa_hypothesis_candidates_for_selection"] = json.dumps(
                 compact_candidates,
                 ensure_ascii=False,
@@ -788,9 +667,9 @@ class ScRTAWorkflow:
                 "If the selector output is malformed, the workflow fails rather than selecting "
                 "a deterministic fallback candidate."
             )
-            selection_payload["llm_hypothesis_generator_artifact"] = generator_artifact + ".md"
+            selection_payload["llm_hypothesis_generator_artifact"] = "rag_grounded_hypothesis_candidates.md"
             selection_payload["llm_selector_artifact"] = "agent_hypothesis_selector.md"
-            selection_payload["candidate_index_artifact"] = str(Path(candidate_index_path).name)
+            selection_payload["candidate_index_artifact"] = "hypothesis_candidate_index.json"
             selection_json = store.write_json("selected_hypothesis", selection_payload)
             selection_md_text = (
                 selection.to_markdown()
@@ -808,111 +687,46 @@ class ScRTAWorkflow:
             selection_md = store.write_markdown("selected_hypothesis", selection_md_text)
             self._add_artifact(state, "selected_hypothesis_json", selection_json)
             self._add_artifact(state, "selected_hypothesis", selection_md)
-            break
 
         planner_context = dict(base_context)
         planner_context["selected_hypothesis"] = selection.to_markdown()
         planner_context["rag_grounded_hypothesis_candidates"] = generator.content
         planner_context["rag_grounded_selector_review"] = selector_review_content
         planner_context["dataset_reconnaissance_context"] = dataset_reconnaissance_context
+        planner_context["deep_dive_runtime_contract"] = self._render_deep_dive_runtime_contract(state.run_dir)
         planner = self._call_and_store(
             team,
             store,
             state,
             "deep_planner",
             (
-                "Create the targeted second-stage validation plan for the selected hypothesis. "
-                "This is a PLAN-ONLY step for user review. Do not write Python code, do not emit "
-                "DEEP_DIVE_PYTHON_SCRIPT, and do not describe yourself as implementing a validator. "
-                "Start with a PLAN_REVIEW_SUMMARY block containing 3-8 concrete numbered analyses "
-                "that a user can understand. Then write a detailed hypothesis-specific analysis "
-                "plan with exact comparison axes, required local tables, scTCR support if relevant, "
-                "and falsification/stopping rules. The plan must directly test this selected "
-                "biological claim and must not use a fixed CD8/Treg/clone validation program."
+                "Create and implement the targeted second-stage validation plan for the selected "
+                "hypothesis. Do not use a fixed CD8/Treg/clone validation program; choose only "
+                "analyses that directly test this selected biological claim. Output a "
+                "hypothesis-specific execution contract and a complete standalone Python script "
+                "between DEEP_DIVE_PYTHON_SCRIPT and END_DEEP_DIVE_PYTHON_SCRIPT."
             ),
             self._context_with_rag(
                 planner_context,
                 rag_chunks,
-                "plan selected hypothesis deep-dive validation RAG-guided dataset-specific tests",
+                "deep-dive validation selected biological hypothesis RAG-guided dataset-specific tests",
                 store=store,
                 state=state,
                 agent_name="deep_planner",
             ),
         )
         responses.append(planner)
-        if self.config.interactive_plan_review:
-            reviewed_planner, review_responses = self._run_agent_plan_review(
-                team=team,
-                store=store,
-                state=state,
-                stage="Deep-Dive",
-                plan_text=planner.content,
-                revision_agent_name="deep_planner",
-                revision_instruction=(
-                    "Revise the selected-hypothesis deep-dive analysis plan according to the "
-                    "user's interactive feedback. This remains a PLAN-ONLY step. Do not write "
-                    "Python code and do not emit DEEP_DIVE_PYTHON_SCRIPT. Keep the selected "
-                    "hypothesis fixed unless the user explicitly edits its wording. Return a "
-                    "PLAN_REVIEW_SUMMARY block with concrete numbered analyses, followed by the "
-                    "full revised plan."
-                ),
-                revision_context={
-                    **planner_context,
-                    "original_deep_dive_plan": planner.content,
-                },
-                rag_chunks=rag_chunks,
-                rag_query="revise selected hypothesis deep-dive plan user feedback scRNA scTCR",
-                artifact_prefix="deep_dive",
-            )
-            planner = reviewed_planner
-            responses.extend(review_responses)
         deep_plan_path = store.write_markdown("selected_hypothesis_deep_dive_plan", planner.content)
         self._add_artifact(state, "selected_hypothesis_deep_dive_plan", deep_plan_path)
 
-        implementation_context = dict(planner_context)
-        implementation_context["confirmed_deep_dive_plan"] = planner.content
-        implementation_context["deep_dive_runtime_contract"] = self._render_deep_dive_runtime_contract(state.run_dir)
-        implementation_context["plan_implementation_requirement"] = "\n".join(
-            [
-                "Implement the confirmed selected-hypothesis deep-dive plan exactly.",
-                "Do not replace the confirmed plan with a generic validator.",
-                "The Python script must execute the concrete analyses listed in PLAN_REVIEW_SUMMARY when feasible.",
-                "If a confirmed analysis cannot be run from local outputs, write an explicit skipped reason.",
-                "Return a complete standalone Python script between DEEP_DIVE_PYTHON_SCRIPT and END_DEEP_DIVE_PYTHON_SCRIPT.",
-            ]
-        )
-        implementation = self._call_and_store(
-            team,
-            store,
-            state,
-            "deep_planner",
-            (
-                "Write the Python implementation for the confirmed deep-dive plan. Do not create "
-                "a new plan and do not substitute a generic validator. Preserve the selected "
-                "hypothesis and implement the confirmed analysis steps as directly as local "
-                "outputs allow. Return the full executable script between DEEP_DIVE_PYTHON_SCRIPT "
-                "and END_DEEP_DIVE_PYTHON_SCRIPT."
-            ),
-            self._context_with_rag(
-                implementation_context,
-                rag_chunks,
-                "implement confirmed selected hypothesis deep-dive plan scRNA scTCR Python",
-                store=store,
-                state=state,
-                agent_name="deep_planner_code",
-            ),
-            artifact_name="agent_deep_planner_code",
-        )
-        responses.append(implementation)
-
         try:
-            deep_script_text = render_deep_dive_script(state.run_dir, selection, implementation.content)
+            deep_script_text = render_deep_dive_script(state.run_dir, selection, planner.content)
         except ValueError as exc:
             path = store.write_markdown(
                 "hypothesis_deep_dive_execution",
                 (
                     "# Hypothesis Deep-Dive Execution\n\n"
-                    "Failed before execution because the deep_planner code step did not emit a valid Python script block.\n\n"
+                    "Failed before execution because the deep_planner did not emit a valid Python script block.\n\n"
                     f"Error: {exc}\n"
                 ),
             )
@@ -925,7 +739,7 @@ class ScRTAWorkflow:
             store=store,
             state=state,
             script_path=deep_script_path,
-            deep_context=implementation_context,
+            deep_context=planner_context,
             selection=selection,
             rag_chunks=rag_chunks,
         )
@@ -1301,6 +1115,7 @@ class ScRTAWorkflow:
             planner_context["rag_grounded_hypothesis_candidates"] = generator.content
             planner_context["rag_grounded_selector_review"] = selector.content
             planner_context["dataset_reconnaissance_context"] = dataset_reconnaissance_context
+            planner_context["deep_dive_runtime_contract"] = self._render_deep_dive_runtime_contract(state.run_dir)
             planner_context["rejected_hypotheses_from_prior_attempts"] = json.dumps(
                 rejected_hypotheses,
                 ensure_ascii=False,
@@ -1312,17 +1127,17 @@ class ScRTAWorkflow:
                 state,
                 "deep_planner",
                 (
-                    "Create a targeted second-stage validation plan for this replacement hypothesis. "
-                    "This is a PLAN-ONLY step. Do not write Python code and do not emit "
-                    "DEEP_DIVE_PYTHON_SCRIPT. Do not repeat tests whose failure already rejected "
-                    "prior hypotheses unless they are needed as controls. Start with a "
-                    "PLAN_REVIEW_SUMMARY block containing concrete numbered analyses, then write "
-                    "the detailed plan."
+                    "Create and implement a targeted second-stage validation plan for this replacement "
+                    "hypothesis. Do not repeat tests whose failure already rejected prior hypotheses "
+                    "unless they are needed as controls. Choose analyses that directly test this "
+                    "selected biological claim. Output a hypothesis-specific execution contract and a "
+                    "complete standalone Python script between DEEP_DIVE_PYTHON_SCRIPT and "
+                    "END_DEEP_DIVE_PYTHON_SCRIPT."
                 ),
                 self._context_with_rag(
                     planner_context,
                     rag_chunks,
-                    "plan replacement hypothesis deep-dive validation RAG dataset-specific tests",
+                    "replacement hypothesis deep-dive validation RAG dataset-specific tests",
                     store=store,
                     state=state,
                     agent_name=f"deep_planner_{attempt_label}",
@@ -1337,50 +1152,15 @@ class ScRTAWorkflow:
             self._add_artifact(state, f"{attempt_label}_selected_hypothesis_deep_dive_plan", attempt_deep_plan_path)
             self._add_artifact(state, "selected_hypothesis_deep_dive_plan", canonical_deep_plan_path)
 
-            implementation_context = dict(planner_context)
-            implementation_context["confirmed_deep_dive_plan"] = planner.content
-            implementation_context["deep_dive_runtime_contract"] = self._render_deep_dive_runtime_contract(state.run_dir)
-            implementation_context["plan_implementation_requirement"] = "\n".join(
-                [
-                    "Implement the confirmed replacement-hypothesis deep-dive plan exactly.",
-                    "Do not replace the confirmed plan with a generic validator.",
-                    "Return a complete standalone Python script between DEEP_DIVE_PYTHON_SCRIPT and END_DEEP_DIVE_PYTHON_SCRIPT.",
-                ]
-            )
-            implementation = self._call_and_store(
-                team,
-                store,
-                state,
-                "deep_planner",
-                (
-                    "Write the Python implementation for the confirmed replacement-hypothesis "
-                    "deep-dive plan. Do not create a new plan and do not substitute a generic "
-                    "validator. Return the full executable script between DEEP_DIVE_PYTHON_SCRIPT "
-                    "and END_DEEP_DIVE_PYTHON_SCRIPT."
-                ),
-                self._context_with_rag(
-                    implementation_context,
-                    rag_chunks,
-                    "implement confirmed replacement hypothesis deep-dive plan scRNA scTCR Python",
-                    store=store,
-                    state=state,
-                    agent_name=f"deep_planner_code_{attempt_label}",
-                ),
-                artifact_name=f"{attempt_label}_agent_deep_planner_code",
-            )
-            responses.append(implementation)
-            canonical_implementation = store.write_markdown("agent_deep_planner_code", implementation.content)
-            self._add_artifact(state, "agent_deep_planner_code", canonical_implementation)
-
             shutil.rmtree(state.run_dir / "analysis_outputs" / "deep_dive", ignore_errors=True)
             try:
-                deep_script_text = render_deep_dive_script(state.run_dir, selection, implementation.content)
+                deep_script_text = render_deep_dive_script(state.run_dir, selection, planner.content)
             except ValueError as exc:
                 path = store.write_markdown(
                     "hypothesis_deep_dive_execution",
                     (
                         "# Hypothesis Deep-Dive Execution\n\n"
-                        "Failed before execution because the deep_planner code step did not emit a valid Python script block.\n\n"
+                        "Failed before execution because the deep_planner did not emit a valid Python script block.\n\n"
                         f"Error: {exc}\n"
                     ),
                 )
@@ -1393,7 +1173,7 @@ class ScRTAWorkflow:
                 store=store,
                 state=state,
                 script_path=deep_script_path,
-                deep_context=implementation_context,
+                deep_context=planner_context,
                 selection=selection,
                 rag_chunks=rag_chunks,
             )
@@ -2054,7 +1834,7 @@ class ScRTAWorkflow:
         downstream_context = dict(base_context)
         downstream_context["selected_hypothesis"] = read_text(selected_hypothesis_path)
         downstream_context["dataset_reconnaissance_context"] = self._render_dataset_reconnaissance_context(state.run_dir)
-        downstream_runtime_contract = "\n".join(
+        downstream_context["downstream_runtime_contract"] = "\n".join(
             [
                 "# Downstream Runtime Contract",
                 "",
@@ -2108,16 +1888,13 @@ class ScRTAWorkflow:
             state,
             "downstream_analyst",
             (
-                "Design the selected-hypothesis downstream analysis after reading RAG, dataset "
-                "reconnaissance outputs, deep-dive results, biological interpretation, and mechanism "
-                "mapping. This is a PLAN-ONLY step for user review. Do not write Python code and do "
-                "not emit DOWNSTREAM_PYTHON_SCRIPT. Start with a PLAN_REVIEW_SUMMARY block containing "
-                "3-8 concrete numbered analyses that a user can understand. Then write a detailed "
-                "hypothesis-specific downstream plan. Do not rely on a fixed downstream template. "
-                "Do not force pseudobulk, pathway, repertoire, clone-state, same-clone, or receptor "
-                "modules. Consider scTCR because this is a paired dataset, but include only scTCR "
-                "analyses that are scientifically relevant to the selected hypothesis and feasible "
-                "from available outputs."
+                "Design and implement the selected-hypothesis downstream analysis after reading RAG, "
+                "dataset reconnaissance outputs, deep-dive results, biological interpretation, and mechanism mapping. "
+                "Do not rely on a fixed downstream template. Output a hypothesis-specific execution contract and a "
+                "complete standalone Python script between DOWNSTREAM_PYTHON_SCRIPT and END_DOWNSTREAM_PYTHON_SCRIPT. "
+                "Do not force pseudobulk, pathway, repertoire, clone-state, same-clone, or receptor modules. "
+                "Consider scTCR because this is a paired dataset, but include only scTCR analyses that are "
+                "scientifically relevant to the selected hypothesis and feasible from available outputs."
             ),
             self._context_with_rag(
                 downstream_context,
@@ -2132,80 +1909,15 @@ class ScRTAWorkflow:
             ),
         )
         responses.append(downstream_analyst)
-        if self.config.interactive_plan_review:
-            reviewed_downstream, review_responses = self._run_agent_plan_review(
-                team=team,
-                store=store,
-                state=state,
-                stage="Downstream",
-                plan_text=downstream_analyst.content,
-                revision_agent_name="downstream_analyst",
-                revision_instruction=(
-                    "Revise the selected-hypothesis downstream analysis plan according to "
-                    "the user's interactive feedback. This remains a PLAN-ONLY step. Do not "
-                    "write Python code and do not emit DOWNSTREAM_PYTHON_SCRIPT. Keep the "
-                    "selected hypothesis and executed deep-dive result context fixed, add or "
-                    "remove downstream analyses as requested, and return a PLAN_REVIEW_SUMMARY "
-                    "block with concrete numbered analyses followed by the full revised plan."
-                ),
-                revision_context={
-                    **downstream_context,
-                    "original_downstream_plan": downstream_analyst.content,
-                },
-                rag_chunks=rag_chunks,
-                rag_query="revise selected hypothesis downstream analysis plan user feedback scRNA scTCR",
-                artifact_prefix="downstream",
-            )
-            downstream_analyst = reviewed_downstream
-            responses.extend(review_responses)
-
-        downstream_plan_path = store.write_markdown("selected_hypothesis_downstream_plan", downstream_analyst.content)
-        self._add_artifact(state, "selected_hypothesis_downstream_plan", downstream_plan_path)
-
-        downstream_implementation_context = dict(downstream_context)
-        downstream_implementation_context["confirmed_downstream_plan"] = downstream_analyst.content
-        downstream_implementation_context["downstream_runtime_contract"] = downstream_runtime_contract
-        downstream_implementation_context["plan_implementation_requirement"] = "\n".join(
-            [
-                "Implement the confirmed selected-hypothesis downstream plan exactly.",
-                "Do not replace the confirmed plan with a generic downstream workflow.",
-                "The Python script must execute the concrete analyses listed in PLAN_REVIEW_SUMMARY when feasible.",
-                "If a confirmed analysis cannot be run from local outputs, write an explicit skipped reason.",
-                "Return a complete standalone Python script between DOWNSTREAM_PYTHON_SCRIPT and END_DOWNSTREAM_PYTHON_SCRIPT.",
-            ]
-        )
-        downstream_code = self._call_and_store(
-            team,
-            store,
-            state,
-            "downstream_analyst",
-            (
-                "Write the Python implementation for the confirmed downstream plan. Do not create "
-                "a new plan and do not substitute a generic workflow. Preserve the selected "
-                "hypothesis and implement the confirmed downstream analysis steps as directly as "
-                "local outputs allow. Return the full executable script between "
-                "DOWNSTREAM_PYTHON_SCRIPT and END_DOWNSTREAM_PYTHON_SCRIPT."
-            ),
-            self._context_with_rag(
-                downstream_implementation_context,
-                rag_chunks,
-                "implement confirmed downstream selected hypothesis plan scRNA scTCR Python",
-                store=store,
-                state=state,
-                agent_name="downstream_analyst_code",
-            ),
-            artifact_name="agent_downstream_analyst_code",
-        )
-        responses.append(downstream_code)
 
         try:
-            script_text = render_downstream_analysis_script(state.run_dir, downstream_code.content)
+            script_text = render_downstream_analysis_script(state.run_dir, downstream_analyst.content)
         except ValueError as exc:
             path = store.write_markdown(
                 "hypothesis_downstream_execution",
                 (
                     "# Hypothesis Downstream Analysis Execution\n\n"
-                    "Failed before execution because the downstream_analyst code step did not emit a valid Python script block.\n\n"
+                    "Failed before execution because the downstream_analyst did not emit a valid Python script block.\n\n"
                     f"Error: {exc}\n"
                 ),
             )
@@ -2218,7 +1930,7 @@ class ScRTAWorkflow:
             store=store,
             state=state,
             script_path=script_path,
-            downstream_context=downstream_implementation_context,
+            downstream_context=downstream_context,
             rag_chunks=rag_chunks,
         )
         self._add_artifact(state, "hypothesis_downstream_execution", status_path)
@@ -2876,271 +2588,6 @@ class ScRTAWorkflow:
         if len(sections) == 1:
             sections.append("\nNo dataset reconnaissance output files were available.")
         return "\n".join(sections)
-
-    @staticmethod
-    def _collect_plan_feedback_in_console(plan_context: str) -> str:
-        print("")
-        print("Interactive plan review")
-        print("-----------------------")
-        print(truncate_text(plan_context, 12000))
-        print("")
-        print("Enter plan feedback, additional analyses, or requested changes.")
-        print("Submit an empty line immediately to approve without changes.")
-        print("End feedback with a line containing only a single period.")
-        first = input("> ")
-        if not first.strip():
-            return ""
-        lines = [first]
-        while True:
-            line = input("> ")
-            if line.strip() == ".":
-                break
-            lines.append(line)
-        return "\n".join(lines).strip()
-
-    @staticmethod
-    def _render_plan_review_display(stage: str, plan_text: str) -> str:
-        compact = ScRTAWorkflow._strip_executable_blocks(plan_text)
-        items = ScRTAWorkflow._extract_plan_review_summary_items(compact)
-        if not items:
-            items = ScRTAWorkflow._extract_user_facing_plan_items(compact, max_items=8)
-        if not items:
-            items = ScRTAWorkflow._fallback_plan_review_items(stage, compact)
-
-        lines = [
-            f"# {stage} Plan Review",
-            "",
-            "The workflow will run these analyses next:",
-            "",
-        ]
-        for index, item in enumerate(items, start=1):
-            lines.append(f"{index}. {item}")
-        lines.extend(
-            [
-                "",
-                "Edit this plan by typing requested changes below. For example, ask to add an analysis, remove a step,",
-                "focus on a specific group or cell state, or change the validation priority.",
-                "",
-            ]
-        )
-        return "\n".join(lines)
-
-    @staticmethod
-    def _extract_plan_review_summary_items(plan_text: str) -> list[str]:
-        match = re.search(
-            r"PLAN_REVIEW_SUMMARY\s*(.*?)\s*END_PLAN_REVIEW_SUMMARY",
-            plan_text or "",
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if not match:
-            return []
-        block = match.group(1).strip()
-        items: list[str] = []
-        for raw_line in block.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            candidate = re.sub(r"^(?:[-*+]|\d+[\.)])\s+", "", line).strip()
-            candidate = ScRTAWorkflow._clean_plan_item(candidate)
-            if candidate and "[truncated]" not in candidate.lower() and candidate not in items:
-                items.append(candidate)
-        return items[:8]
-
-    @staticmethod
-    def _strip_executable_blocks(plan_text: str) -> str:
-        compact = re.sub(
-            r"(?is)DEEP_DIVE_PYTHON_SCRIPT.*?END_DEEP_DIVE_PYTHON_SCRIPT",
-            "",
-            plan_text,
-        )
-        compact = re.sub(
-            r"(?is)DOWNSTREAM_PYTHON_SCRIPT.*?END_DOWNSTREAM_PYTHON_SCRIPT",
-            "",
-            compact,
-        )
-        compact = re.sub(r"(?is)```(?:python|json|text|bash|shell)?\s*.*?```", "", compact)
-        return compact
-
-    @staticmethod
-    def _extract_user_facing_plan_items(plan_text: str, max_items: int = 8) -> list[str]:
-        skip_section = False
-        items: list[str] = []
-        for raw_line in plan_text.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line.startswith("#"):
-                title = line.lstrip("#").strip().lower()
-                skip_section = any(
-                    token in title
-                    for token in [
-                        "execution contract",
-                        "runtime contract",
-                        "script",
-                        "artifact",
-                        "manifest",
-                        "output files",
-                        "file paths",
-                    ]
-                )
-                continue
-            if skip_section:
-                continue
-
-            candidate = ""
-            match = re.match(r"^(?:[-*+]|\d+[\.)])\s+(.*)$", line)
-            if match:
-                candidate = match.group(1).strip()
-            elif re.match(r"^(?:aim|objective|analysis|test|step|module)\b[:\s-]", line, flags=re.IGNORECASE):
-                candidate = line
-            if not candidate:
-                continue
-
-            candidate = ScRTAWorkflow._clean_plan_item(candidate)
-            for item in ScRTAWorkflow._split_plan_item(candidate):
-                if ScRTAWorkflow._is_user_facing_analysis_item(item) and item not in items:
-                    items.append(item)
-            if len(items) >= max_items:
-                return items
-
-        if len(items) >= 3:
-            return items
-
-        sentences = re.split(r"(?<=[.!?])\s+", " ".join(line.strip() for line in plan_text.splitlines()))
-        for sentence in sentences:
-            candidate = ScRTAWorkflow._clean_plan_item(sentence)
-            for item in ScRTAWorkflow._split_plan_item(candidate):
-                if ScRTAWorkflow._is_user_facing_analysis_item(item) and item not in items:
-                    items.append(item)
-            if len(items) >= max_items:
-                break
-        return items
-
-    @staticmethod
-    def _clean_plan_item(item: str) -> str:
-        item = re.sub(r"[*_`#]+", "", item).strip()
-        item = re.sub(r"^\[(?: |x|X)\]\s*", "", item).strip()
-        item = re.sub(r"^(?:short\s+)?(?:deep[- ]dive|downstream)\s+plan\s*:\s*", "", item, flags=re.IGNORECASE)
-        item = re.sub(r"^(?:task|analysis|test|step|module)\s*\d*[:.)-]\s*", "", item, flags=re.IGNORECASE)
-        item = re.sub(r"\s+", " ", item).strip(" -:;")
-        return item
-
-    @staticmethod
-    def _split_plan_item(item: str) -> list[str]:
-        item = item.strip()
-        if not item:
-            return []
-        lowered = item.lower()
-        if len(item) < 180:
-            return [item]
-        if "first " not in lowered and " then " not in lowered and " next " not in lowered and " finally " not in lowered:
-            return [item]
-
-        text = re.sub(r"\bI will\b", "", item, flags=re.IGNORECASE).strip()
-        text = re.sub(r"\bfirst\b", "", text, flags=re.IGNORECASE).strip(" ,;")
-        fragments = re.split(
-            r"\s+(?:and\s+then|then|next|afterward|afterwards|finally)\s+",
-            text,
-            flags=re.IGNORECASE,
-        )
-        cleaned: list[str] = []
-        for fragment in fragments:
-            fragment = ScRTAWorkflow._clean_plan_item(fragment)
-            if fragment and len(fragment) >= 18:
-                cleaned.append(fragment[0].upper() + fragment[1:])
-        return cleaned or [item]
-
-    @staticmethod
-    def _is_user_facing_analysis_item(item: str) -> bool:
-        if len(item) < 18:
-            return False
-        lowered = item.lower()
-        blocked = [
-            "python",
-            "script",
-            "function",
-            "import ",
-            "csv",
-            "json",
-            "stdout",
-            "stderr",
-            "artifact",
-            "manifest",
-            "directory",
-            "write ",
-            "read ",
-            "marker",
-            "execution contract",
-            "standalone",
-            "file path",
-            "i will",
-            "implement",
-            "validator",
-            "planning agent",
-            "existing analysis outputs",
-            "needed to",
-            "[truncated]",
-        ]
-        if any(token in lowered for token in blocked):
-            return False
-        analysis_terms = [
-            "analyze",
-            "assess",
-            "compare",
-            "contrast",
-            "correlate",
-            "detect",
-            "estimate",
-            "evaluate",
-            "identify",
-            "map",
-            "measure",
-            "model",
-            "quantify",
-            "score",
-            "stratify",
-            "summarize",
-            "test",
-            "validate",
-            "cell",
-            "clone",
-            "clonotype",
-            "gene",
-            "group",
-            "pathway",
-            "patient",
-            "program",
-            "repertoire",
-            "state",
-            "tcr",
-            "tissue",
-        ]
-        return any(term in lowered for term in analysis_terms)
-
-    @staticmethod
-    def _fallback_plan_review_items(stage: str, plan_text: str) -> list[str]:
-        lowered = plan_text.lower()
-        if stage.lower().startswith("deep"):
-            items = [
-                "Review the selected hypothesis and identify the metadata, cell-state labels, and gene programs needed for validation.",
-                "Use available RNA and TCR summary tables to test whether the selected biological pattern is supported.",
-                "Compare the relevant cell states or sample groups and summarize whether the hypothesis is supported, partially supported, or unsupported.",
-            ]
-            if "clone" in lowered or "tcr" in lowered or "clonotype" in lowered:
-                items.insert(
-                    2,
-                    "Use scTCR evidence conservatively to assess clonotype expansion, state occupancy, or lineage support when relevant.",
-                )
-            return items
-
-        items = [
-            "Extend the selected hypothesis with additional RNA-state, pathway, or marker-program analyses.",
-            "Add scTCR-supported analyses only where they help interpret lineage, clone expansion, repertoire diversity, or state occupancy.",
-            "Generate result tables and figure-ready summaries that directly support or weaken the selected hypothesis.",
-        ]
-        if "mechanism" in lowered or "pathway" in lowered:
-            items.insert(1, "Map the strongest RNA signals to mechanism-level pathways or biological programs.")
-        return items
 
     @staticmethod
     def _render_team_summary(responses: list[AgentResponse]) -> str:
