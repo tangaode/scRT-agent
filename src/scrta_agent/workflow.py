@@ -2742,8 +2742,7 @@ class ScRTAWorkflow:
         compact = ScRTAWorkflow._strip_executable_blocks(plan_text)
         items = ScRTAWorkflow._extract_user_facing_plan_items(compact, max_items=8)
         if not items:
-            fallback = truncate_text(" ".join(line.strip() for line in compact.splitlines() if line.strip()), 1200)
-            items = [fallback] if fallback else ["No concise analysis step could be extracted from the generated plan."]
+            items = ScRTAWorkflow._fallback_plan_review_items(stage, compact)
 
         lines = [
             f"# {stage} Plan Review",
@@ -2814,8 +2813,9 @@ class ScRTAWorkflow:
                 continue
 
             candidate = ScRTAWorkflow._clean_plan_item(candidate)
-            if ScRTAWorkflow._is_user_facing_analysis_item(candidate):
-                items.append(candidate)
+            for item in ScRTAWorkflow._split_plan_item(candidate):
+                if ScRTAWorkflow._is_user_facing_analysis_item(item) and item not in items:
+                    items.append(item)
             if len(items) >= max_items:
                 return items
 
@@ -2825,8 +2825,9 @@ class ScRTAWorkflow:
         sentences = re.split(r"(?<=[.!?])\s+", " ".join(line.strip() for line in plan_text.splitlines()))
         for sentence in sentences:
             candidate = ScRTAWorkflow._clean_plan_item(sentence)
-            if ScRTAWorkflow._is_user_facing_analysis_item(candidate) and candidate not in items:
-                items.append(candidate)
+            for item in ScRTAWorkflow._split_plan_item(candidate):
+                if ScRTAWorkflow._is_user_facing_analysis_item(item) and item not in items:
+                    items.append(item)
             if len(items) >= max_items:
                 break
         return items
@@ -2835,9 +2836,35 @@ class ScRTAWorkflow:
     def _clean_plan_item(item: str) -> str:
         item = re.sub(r"[*_`#]+", "", item).strip()
         item = re.sub(r"^\[(?: |x|X)\]\s*", "", item).strip()
+        item = re.sub(r"^(?:short\s+)?(?:deep[- ]dive|downstream)\s+plan\s*:\s*", "", item, flags=re.IGNORECASE)
         item = re.sub(r"^(?:task|analysis|test|step|module)\s*\d*[:.)-]\s*", "", item, flags=re.IGNORECASE)
         item = re.sub(r"\s+", " ", item).strip(" -:;")
-        return truncate_text(item, 230)
+        return item
+
+    @staticmethod
+    def _split_plan_item(item: str) -> list[str]:
+        item = item.strip()
+        if not item:
+            return []
+        lowered = item.lower()
+        if len(item) < 180:
+            return [item]
+        if "first " not in lowered and " then " not in lowered and " next " not in lowered and " finally " not in lowered:
+            return [item]
+
+        text = re.sub(r"\bI will\b", "", item, flags=re.IGNORECASE).strip()
+        text = re.sub(r"\bfirst\b", "", text, flags=re.IGNORECASE).strip(" ,;")
+        fragments = re.split(
+            r"\s+(?:and\s+then|then|next|afterward|afterwards|finally)\s+",
+            text,
+            flags=re.IGNORECASE,
+        )
+        cleaned: list[str] = []
+        for fragment in fragments:
+            fragment = ScRTAWorkflow._clean_plan_item(fragment)
+            if fragment and len(fragment) >= 18:
+                cleaned.append(fragment[0].upper() + fragment[1:])
+        return cleaned or [item]
 
     @staticmethod
     def _is_user_facing_analysis_item(item: str) -> bool:
@@ -2862,6 +2889,13 @@ class ScRTAWorkflow:
             "execution contract",
             "standalone",
             "file path",
+            "i will",
+            "implement",
+            "validator",
+            "planning agent",
+            "existing analysis outputs",
+            "needed to",
+            "[truncated]",
         ]
         if any(token in lowered for token in blocked):
             return False
@@ -2898,6 +2932,31 @@ class ScRTAWorkflow:
             "tissue",
         ]
         return any(term in lowered for term in analysis_terms)
+
+    @staticmethod
+    def _fallback_plan_review_items(stage: str, plan_text: str) -> list[str]:
+        lowered = plan_text.lower()
+        if stage.lower().startswith("deep"):
+            items = [
+                "Review the selected hypothesis and identify the metadata, cell-state labels, and gene programs needed for validation.",
+                "Use available RNA and TCR summary tables to test whether the selected biological pattern is supported.",
+                "Compare the relevant cell states or sample groups and summarize whether the hypothesis is supported, partially supported, or unsupported.",
+            ]
+            if "clone" in lowered or "tcr" in lowered or "clonotype" in lowered:
+                items.insert(
+                    2,
+                    "Use scTCR evidence conservatively to assess clonotype expansion, state occupancy, or lineage support when relevant.",
+                )
+            return items
+
+        items = [
+            "Extend the selected hypothesis with additional RNA-state, pathway, or marker-program analyses.",
+            "Add scTCR-supported analyses only where they help interpret lineage, clone expansion, repertoire diversity, or state occupancy.",
+            "Generate result tables and figure-ready summaries that directly support or weaken the selected hypothesis.",
+        ]
+        if "mechanism" in lowered or "pathway" in lowered:
+            items.insert(1, "Map the strongest RNA signals to mechanism-level pathways or biological programs.")
+        return items
 
     @staticmethod
     def _render_team_summary(responses: list[AgentResponse]) -> str:
