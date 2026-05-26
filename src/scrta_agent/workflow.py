@@ -268,17 +268,6 @@ class ScRTAWorkflow:
         )
         prior_outputs.append(skeptic)
 
-        if self.config.interactive_plan_review:
-            plan_review_outputs = self._run_interactive_plan_review(
-                team=team,
-                store=store,
-                state=state,
-                base_context=base_context,
-                prior_outputs=prior_outputs,
-                rag_chunks=rag_chunks,
-            )
-            prior_outputs.extend(plan_review_outputs)
-
         code_writer = self._call_and_store(
             team,
             store,
@@ -509,18 +498,35 @@ class ScRTAWorkflow:
         store.event("finish", {"summary": f"finished {self.config.analysis_name}"})
         return state
 
-    def _run_interactive_plan_review(
+    def _run_agent_plan_review(
         self,
         team: ScRTATeam,
         store: ArtifactStore,
         state: WorkflowState,
-        base_context: dict,
-        prior_outputs: list[AgentResponse],
+        stage: str,
+        plan_text: str,
+        revision_agent_name: str,
+        revision_instruction: str,
+        revision_context: dict,
         rag_chunks: list,
-    ) -> list[AgentResponse]:
-        plan_context = self._render_plan_review_context(prior_outputs)
-        context_path = store.write_markdown("interactive_plan_review_context", plan_context)
-        self._add_artifact(state, "interactive_plan_review_context", context_path)
+        rag_query: str,
+        artifact_prefix: str,
+    ) -> tuple[AgentResponse, list[AgentResponse]]:
+        plan_context = "\n".join(
+            [
+                f"# {stage} Plan Review",
+                "",
+                "This plan was generated after hypothesis selection and before execution.",
+                "User feedback will be sent back to the same planning agent so it can revise the plan and script.",
+                "",
+                "## Generated Plan",
+                "",
+                plan_text.strip(),
+                "",
+            ]
+        )
+        context_path = store.write_markdown(f"{artifact_prefix}_interactive_plan_review_context", plan_context)
+        self._add_artifact(state, f"{artifact_prefix}_interactive_plan_review_context", context_path)
 
         if self.plan_review_callback is not None:
             raw_feedback = self.plan_review_callback(plan_context)
@@ -528,47 +534,48 @@ class ScRTAWorkflow:
             raw_feedback = self._collect_plan_feedback_in_console(plan_context)
         feedback = raw_feedback.strip()
         if not feedback:
-            feedback = "The user approved the initial multi-agent plan without additional changes."
+            feedback = f"The user approved the {stage} plan without additional changes."
 
         feedback_response = AgentResponse(
             agent_name="interactive_plan_feedback",
-            content="# Interactive Plan Feedback\n\n" + feedback + "\n",
-            metadata={"mode": "interactive", "role": "human_plan_feedback"},
+            content=f"# Interactive {stage} Plan Feedback\n\n" + feedback + "\n",
+            metadata={"mode": "interactive", "role": "human_plan_feedback", "stage": stage},
         )
-        feedback_path = store.write_markdown("interactive_plan_feedback", feedback_response.content)
-        self._add_artifact(state, "interactive_plan_feedback", feedback_path)
-        feedback_meta_path = store.write_json("interactive_plan_feedback_metadata", asdict(feedback_response))
-        self._add_artifact(state, "interactive_plan_feedback_metadata", feedback_meta_path)
+        feedback_path = store.write_markdown(f"{artifact_prefix}_interactive_plan_feedback", feedback_response.content)
+        self._add_artifact(state, f"{artifact_prefix}_interactive_plan_feedback", feedback_path)
+        feedback_meta_path = store.write_json(
+            f"{artifact_prefix}_interactive_plan_feedback_metadata",
+            asdict(feedback_response),
+        )
+        self._add_artifact(state, f"{artifact_prefix}_interactive_plan_feedback_metadata", feedback_meta_path)
 
-        if feedback == "The user approved the initial multi-agent plan without additional changes.":
-            return [feedback_response]
+        if feedback == f"The user approved the {stage} plan without additional changes.":
+            return AgentResponse(
+                agent_name=revision_agent_name,
+                content=plan_text,
+                metadata={"mode": "llm", "role": f"{stage}_approved_plan"},
+            ), [feedback_response]
 
-        revision_context = self._context_with_prior(base_context, [*prior_outputs, feedback_response])
+        revision_context = dict(revision_context)
         revision_context["interactive_plan_review_context"] = plan_context
         revision_context["interactive_plan_feedback"] = feedback
-        plan_revision = self._call_and_store(
+        revised_plan = self._call_and_store(
             team,
             store,
             state,
-            "integrator",
-            (
-                "Revise the initial scRNA/scTCR analysis plan according to the user's "
-                "interactive plan feedback. Preserve feasible dataset-aware and RAG-grounded "
-                "components, add or modify analyses requested by the user, and make clear "
-                "which instructions should constrain subsequent code generation, hypothesis "
-                "generation, deep-dive planning, downstream analysis, and figure design."
-            ),
+            revision_agent_name,
+            revision_instruction,
             self._context_with_rag(
                 revision_context,
                 rag_chunks,
-                "revise user-edited scRNA scTCR analysis plan interactive feedback hypothesis downstream figures",
+                rag_query,
                 store=store,
                 state=state,
-                agent_name="plan_revision",
+                agent_name=f"{artifact_prefix}_plan_revision",
             ),
-            artifact_name="agent_plan_revision",
+            artifact_name=f"{artifact_prefix}_agent_plan_revision",
         )
-        return [feedback_response, plan_revision]
+        return revised_plan, [feedback_response, revised_plan]
 
     def _run_deep_dive_loop(
         self,
@@ -791,6 +798,32 @@ class ScRTAWorkflow:
             ),
         )
         responses.append(planner)
+        if self.config.interactive_plan_review:
+            reviewed_planner, review_responses = self._run_agent_plan_review(
+                team=team,
+                store=store,
+                state=state,
+                stage="Deep-Dive",
+                plan_text=planner.content,
+                revision_agent_name="deep_planner",
+                revision_instruction=(
+                    "Revise the selected-hypothesis deep-dive plan according to the user's "
+                    "interactive feedback. Keep the selected hypothesis fixed unless the user "
+                    "explicitly edits its wording. Add, remove, or reprioritize analyses as "
+                    "requested, then return the full revised execution contract and complete "
+                    "standalone Python script between DEEP_DIVE_PYTHON_SCRIPT and "
+                    "END_DEEP_DIVE_PYTHON_SCRIPT."
+                ),
+                revision_context={
+                    **planner_context,
+                    "original_deep_dive_plan": planner.content,
+                },
+                rag_chunks=rag_chunks,
+                rag_query="revise selected hypothesis deep-dive plan user feedback scRNA scTCR",
+                artifact_prefix="deep_dive",
+            )
+            planner = reviewed_planner
+            responses.extend(review_responses)
         deep_plan_path = store.write_markdown("selected_hypothesis_deep_dive_plan", planner.content)
         self._add_artifact(state, "selected_hypothesis_deep_dive_plan", deep_plan_path)
 
@@ -1984,6 +2017,32 @@ class ScRTAWorkflow:
             ),
         )
         responses.append(downstream_analyst)
+        if self.config.interactive_plan_review:
+            reviewed_downstream, review_responses = self._run_agent_plan_review(
+                team=team,
+                store=store,
+                state=state,
+                stage="Downstream",
+                plan_text=downstream_analyst.content,
+                revision_agent_name="downstream_analyst",
+                revision_instruction=(
+                    "Revise the selected-hypothesis downstream analysis plan according to "
+                    "the user's interactive feedback. Keep the selected hypothesis and "
+                    "executed deep-dive result context fixed, add or remove downstream "
+                    "analyses as requested, and return a hypothesis-specific execution "
+                    "contract plus a complete standalone Python script between "
+                    "DOWNSTREAM_PYTHON_SCRIPT and END_DOWNSTREAM_PYTHON_SCRIPT."
+                ),
+                revision_context={
+                    **downstream_context,
+                    "original_downstream_plan": downstream_analyst.content,
+                },
+                rag_chunks=rag_chunks,
+                rag_query="revise selected hypothesis downstream analysis plan user feedback scRNA scTCR",
+                artifact_prefix="downstream",
+            )
+            downstream_analyst = reviewed_downstream
+            responses.extend(review_responses)
 
         try:
             script_text = render_downstream_analysis_script(state.run_dir, downstream_analyst.content)
@@ -2663,39 +2722,6 @@ class ScRTAWorkflow:
         if len(sections) == 1:
             sections.append("\nNo dataset reconnaissance output files were available.")
         return "\n".join(sections)
-
-    @staticmethod
-    def _render_plan_review_context(responses: list[AgentResponse]) -> str:
-        selected_agents = {
-            "leader",
-            "rna_analyst",
-            "methodologist",
-            "tcr_analyst",
-            "novelty_scout",
-            "integrator",
-            "skeptic",
-        }
-        parts = [
-            "# Interactive Plan Review Context",
-            "",
-            "The following initial team outputs will guide code generation and later hypothesis work.",
-            "Edit the plan by adding concise instructions in the GUI feedback box or console prompt.",
-            "",
-        ]
-        for response in responses:
-            if response.agent_name not in selected_agents:
-                continue
-            parts.extend(
-                [
-                    f"## {response.agent_name}",
-                    "",
-                    truncate_text(response.content.strip(), 7000),
-                    "",
-                ]
-            )
-        if len(parts) <= 5:
-            parts.append("No reviewable plan outputs were available.")
-        return "\n".join(parts).strip() + "\n"
 
     @staticmethod
     def _collect_plan_feedback_in_console(plan_context: str) -> str:

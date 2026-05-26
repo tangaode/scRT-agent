@@ -57,7 +57,7 @@ class ScRTAgentLauncher(tk.Tk):
         self.status_var = tk.StringVar(value="Ready")
         self.last_run_dir_var = tk.StringVar()
         self.command_preview_var = tk.StringVar()
-        self.plan_review_status_var = tk.StringVar(value="Waiting for initial plan")
+        self.plan_review_status_var = tk.StringVar(value="Waiting for selected-hypothesis plan")
         self.hypothesis_status_var = tk.StringVar(value="Waiting for generated candidates")
         self.hypothesis_title_var = tk.StringVar()
         self.plan_review_holder: dict[str, object] | None = None
@@ -398,7 +398,7 @@ class ScRTAgentLauncher(tk.Tk):
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.status_var.set("Running")
-        self._reset_plan_review("Waiting for initial plan")
+        self._reset_plan_review("Waiting for selected-hypothesis plan")
         self._reset_hypothesis_review("Waiting for generated candidates")
         self.log_text.delete("1.0", tk.END)
         self._update_command_preview()
@@ -541,11 +541,11 @@ class ScRTAgentLauncher(tk.Tk):
         self.plan_review_event = event
         self._set_text(self.plan_review_context_text, plan_context)
         self._set_text(self.plan_review_feedback_text, "")
-        self.plan_review_status_var.set("Review the generated plan, add changes, then continue")
+        self.plan_review_status_var.set("Review the selected-hypothesis plan, add changes, then continue")
         self.confirm_plan_button.configure(state="normal")
         self.cancel_plan_button.configure(state="normal")
         self._append_log(
-            "\nInitial team plan is ready. Add requested plan changes in the Plan Review panel, "
+            "\nA selected-hypothesis plan is ready. Add requested plan changes in the Plan Review panel, "
             "then click Approve Plan and Continue.\n"
         )
 
@@ -563,7 +563,7 @@ class ScRTAgentLauncher(tk.Tk):
         self.plan_review_status_var.set("Plan review confirmed; workflow is continuing")
         self.status_var.set("Running")
         if feedback:
-            self._append_log("\nPlan feedback submitted. The integrator will revise the plan before code generation.\n")
+            self._append_log("\nPlan feedback submitted. The planning agent will revise the plan and script before execution.\n")
         else:
             self._append_log("\nPlan approved without additional changes.\n")
 

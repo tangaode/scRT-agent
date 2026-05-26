@@ -130,13 +130,13 @@ scrta-agent gui
 On Windows, double-click `gui.bat` from the repository root after installation
 or run it from a terminal. The desktop launcher provides file browsers,
 configuration save/reload, run status, live logs, an interactive Plan Review
-panel and a Hypothesis Review panel. After the initial team plan is generated,
-the Plan Review panel lets the user add requested changes or additional
-analyses before code generation. When candidate hypotheses are generated, the
-Hypothesis Review panel is populated with the candidate list and editable
+panel and a Hypothesis Review panel. When candidate hypotheses are generated,
+the Hypothesis Review panel is populated with the candidate list and editable
 fields for the selected hypothesis, explanation, required tests, falsification
-criteria and source tables. The workflow waits until the user confirms a
-hypothesis before continuing to deep-dive analysis.
+criteria and source tables. After the user confirms a hypothesis, the deep-dive
+and downstream plans for that selected hypothesis can be reviewed in the Plan
+Review panel before execution. User feedback is sent back to the planning agent
+so it can revise the plan and script before running.
 
 For the terminal wizard:
 
@@ -179,7 +179,7 @@ scrta-agent run \
   --interactive-hypothesis-selection
 ```
 
-To review and modify the initial plan before code generation:
+To review and modify selected-hypothesis plans before execution:
 
 ```bash
 scrta-agent run \
@@ -269,8 +269,8 @@ scrta-agent run --config examples/config.example.json
 Important options:
 
 - `--execute`: run the generated analysis script.
-- `--interactive-plan-review`: pause after the initial team plan so the user
-  can add plan feedback before code generation.
+- `--interactive-plan-review`: pause after selected-hypothesis plans so the
+  user can add feedback before execution.
 - `--interactive-hypothesis-selection`: pause after hypothesis generation so
   the user can select and edit the hypothesis before deep-dive analysis.
 - `--repair-attempts N`: retry script execution after transient failures.

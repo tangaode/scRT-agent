@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--interactive-plan-review",
         action="store_true",
-        help="pause after the initial team plan so the user can add plan feedback before code generation",
+        help="pause after selected-hypothesis plans so the user can add feedback before execution",
     )
     run.add_argument("--no-deep-dive", dest="deep_dive_enabled", action="store_false", help="disable hypothesis deep-dive loop")
     run.add_argument(
