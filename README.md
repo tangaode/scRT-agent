@@ -129,11 +129,14 @@ scrta-agent gui
 
 On Windows, double-click `gui.bat` from the repository root after installation
 or run it from a terminal. The desktop launcher provides file browsers,
-configuration save/reload, run status, live logs and a Hypothesis Review panel.
-When candidate hypotheses are generated, the panel is populated with the
-candidate list and editable fields for the selected hypothesis, explanation,
-required tests, falsification criteria and source tables. The workflow waits
-until the user confirms a hypothesis before continuing to deep-dive analysis.
+configuration save/reload, run status, live logs, an interactive Plan Review
+panel and a Hypothesis Review panel. After the initial team plan is generated,
+the Plan Review panel lets the user add requested changes or additional
+analyses before code generation. When candidate hypotheses are generated, the
+Hypothesis Review panel is populated with the candidate list and editable
+fields for the selected hypothesis, explanation, required tests, falsification
+criteria and source tables. The workflow waits until the user confirms a
+hypothesis before continuing to deep-dive analysis.
 
 For the terminal wizard:
 
@@ -174,6 +177,18 @@ scrta-agent run \
   --out ./runs \
   --execute \
   --interactive-hypothesis-selection
+```
+
+To review and modify the initial plan before code generation:
+
+```bash
+scrta-agent run \
+  --rna /path/to/sample.h5ad \
+  --tcr /path/to/filtered_contig_annotations.csv \
+  --analysis-name example_plan_review \
+  --out ./runs \
+  --execute \
+  --interactive-plan-review
 ```
 
 With a local RAG index:
@@ -254,6 +269,8 @@ scrta-agent run --config examples/config.example.json
 Important options:
 
 - `--execute`: run the generated analysis script.
+- `--interactive-plan-review`: pause after the initial team plan so the user
+  can add plan feedback before code generation.
 - `--interactive-hypothesis-selection`: pause after hypothesis generation so
   the user can select and edit the hypothesis before deep-dive analysis.
 - `--repair-attempts N`: retry script execution after transient failures.

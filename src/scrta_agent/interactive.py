@@ -24,6 +24,7 @@ def run_interactive_wizard() -> int:
     literature_cards = _ask("Literature cards CSV path (optional)", "")
     rag_index = _ask("RAG chunks JSONL path (optional)", "")
     execute = _ask_yes_no("Execute generated scripts", True)
+    plan_review = _ask_yes_no("Review and edit the initial analysis plan before code generation", True)
     repair_attempts = int(_ask("Script repair attempts", "1"))
     analysis_loops = int(_ask("Hypothesis refinement loop count", "6"))
 
@@ -58,6 +59,7 @@ def run_interactive_wizard() -> int:
         model=model,
         analysis_loops=analysis_loops,
         repair_attempts=repair_attempts,
+        interactive_plan_review=plan_review,
         interactive_hypothesis_selection=True,
     )
     print("")

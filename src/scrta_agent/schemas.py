@@ -146,6 +146,7 @@ class WorkflowConfig:
     mechanism_loop_enabled: bool = True
     downstream_analysis_enabled: bool = True
     interactive_hypothesis_selection: bool = False
+    interactive_plan_review: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -36,6 +36,7 @@ from .utils import ensure_dir, read_text, slugify, truncate_text, utc_timestamp
 
 
 HypothesisSelectionCallback = Callable[[dict[str, dict[str, object]]], DeepDiveSelection]
+PlanReviewCallback = Callable[[str], str]
 
 
 class ScRTAWorkflow:
@@ -46,10 +47,12 @@ class ScRTAWorkflow:
         config: WorkflowConfig,
         llm: LLMClient | None = None,
         hypothesis_selection_callback: HypothesisSelectionCallback | None = None,
+        plan_review_callback: PlanReviewCallback | None = None,
     ) -> None:
         self.config = config
         self.llm = llm or LLMClient(model=config.model, use_llm=config.use_llm)
         self.hypothesis_selection_callback = hypothesis_selection_callback
+        self.plan_review_callback = plan_review_callback
 
     def run(self) -> WorkflowState:
         self.config.use_llm = True
@@ -264,6 +267,17 @@ class ScRTAWorkflow:
             ),
         )
         prior_outputs.append(skeptic)
+
+        if self.config.interactive_plan_review:
+            plan_review_outputs = self._run_interactive_plan_review(
+                team=team,
+                store=store,
+                state=state,
+                base_context=base_context,
+                prior_outputs=prior_outputs,
+                rag_chunks=rag_chunks,
+            )
+            prior_outputs.extend(plan_review_outputs)
 
         code_writer = self._call_and_store(
             team,
@@ -494,6 +508,67 @@ class ScRTAWorkflow:
         self._add_artifact(state, "manifest", store.write_json("manifest", state.to_manifest()))
         store.event("finish", {"summary": f"finished {self.config.analysis_name}"})
         return state
+
+    def _run_interactive_plan_review(
+        self,
+        team: ScRTATeam,
+        store: ArtifactStore,
+        state: WorkflowState,
+        base_context: dict,
+        prior_outputs: list[AgentResponse],
+        rag_chunks: list,
+    ) -> list[AgentResponse]:
+        plan_context = self._render_plan_review_context(prior_outputs)
+        context_path = store.write_markdown("interactive_plan_review_context", plan_context)
+        self._add_artifact(state, "interactive_plan_review_context", context_path)
+
+        if self.plan_review_callback is not None:
+            raw_feedback = self.plan_review_callback(plan_context)
+        else:
+            raw_feedback = self._collect_plan_feedback_in_console(plan_context)
+        feedback = raw_feedback.strip()
+        if not feedback:
+            feedback = "The user approved the initial multi-agent plan without additional changes."
+
+        feedback_response = AgentResponse(
+            agent_name="interactive_plan_feedback",
+            content="# Interactive Plan Feedback\n\n" + feedback + "\n",
+            metadata={"mode": "interactive", "role": "human_plan_feedback"},
+        )
+        feedback_path = store.write_markdown("interactive_plan_feedback", feedback_response.content)
+        self._add_artifact(state, "interactive_plan_feedback", feedback_path)
+        feedback_meta_path = store.write_json("interactive_plan_feedback_metadata", asdict(feedback_response))
+        self._add_artifact(state, "interactive_plan_feedback_metadata", feedback_meta_path)
+
+        if feedback == "The user approved the initial multi-agent plan without additional changes.":
+            return [feedback_response]
+
+        revision_context = self._context_with_prior(base_context, [*prior_outputs, feedback_response])
+        revision_context["interactive_plan_review_context"] = plan_context
+        revision_context["interactive_plan_feedback"] = feedback
+        plan_revision = self._call_and_store(
+            team,
+            store,
+            state,
+            "integrator",
+            (
+                "Revise the initial scRNA/scTCR analysis plan according to the user's "
+                "interactive plan feedback. Preserve feasible dataset-aware and RAG-grounded "
+                "components, add or modify analyses requested by the user, and make clear "
+                "which instructions should constrain subsequent code generation, hypothesis "
+                "generation, deep-dive planning, downstream analysis, and figure design."
+            ),
+            self._context_with_rag(
+                revision_context,
+                rag_chunks,
+                "revise user-edited scRNA scTCR analysis plan interactive feedback hypothesis downstream figures",
+                store=store,
+                state=state,
+                agent_name="plan_revision",
+            ),
+            artifact_name="agent_plan_revision",
+        )
+        return [feedback_response, plan_revision]
 
     def _run_deep_dive_loop(
         self,
@@ -2588,6 +2663,60 @@ class ScRTAWorkflow:
         if len(sections) == 1:
             sections.append("\nNo dataset reconnaissance output files were available.")
         return "\n".join(sections)
+
+    @staticmethod
+    def _render_plan_review_context(responses: list[AgentResponse]) -> str:
+        selected_agents = {
+            "leader",
+            "rna_analyst",
+            "methodologist",
+            "tcr_analyst",
+            "novelty_scout",
+            "integrator",
+            "skeptic",
+        }
+        parts = [
+            "# Interactive Plan Review Context",
+            "",
+            "The following initial team outputs will guide code generation and later hypothesis work.",
+            "Edit the plan by adding concise instructions in the GUI feedback box or console prompt.",
+            "",
+        ]
+        for response in responses:
+            if response.agent_name not in selected_agents:
+                continue
+            parts.extend(
+                [
+                    f"## {response.agent_name}",
+                    "",
+                    truncate_text(response.content.strip(), 7000),
+                    "",
+                ]
+            )
+        if len(parts) <= 5:
+            parts.append("No reviewable plan outputs were available.")
+        return "\n".join(parts).strip() + "\n"
+
+    @staticmethod
+    def _collect_plan_feedback_in_console(plan_context: str) -> str:
+        print("")
+        print("Interactive plan review")
+        print("-----------------------")
+        print(truncate_text(plan_context, 12000))
+        print("")
+        print("Enter plan feedback, additional analyses, or requested changes.")
+        print("Submit an empty line immediately to approve without changes.")
+        print("End feedback with a line containing only a single period.")
+        first = input("> ")
+        if not first.strip():
+            return ""
+        lines = [first]
+        while True:
+            line = input("> ")
+            if line.strip() == ".":
+                break
+            lines.append(line)
+        return "\n".join(lines).strip()
 
     @staticmethod
     def _render_team_summary(responses: list[AgentResponse]) -> str:
