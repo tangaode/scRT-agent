@@ -37,9 +37,10 @@ Rules:
 2. The analysis should have mechanistic depth and should move toward molecular,
    gene-program, pathway, or tumor-microenvironment mechanisms rather than
    stopping at cell proportions or broad state changes.
-3. Include an execution contract and then write the complete standalone Python
-   script that implements that contract. The local workflow will execute your
-   script exactly; there is no fixed downstream template after this step.
+3. Include the execution contract inside the complete standalone Python script
+   and make the script write that contract to `downstream_execution_contract.json`.
+   The local workflow will execute your script exactly; there is no fixed
+   downstream template after this step.
 4. The script should produce analysis-result tables, not placeholder evidence
    audits. Each CSV should contain enough tidy information for a future figure
    when the analysis is successful: grouping variables, effect values, counts,
@@ -77,9 +78,12 @@ Script requirements:
   patient-level or sample-level aggregation when comparing clinical groups.
 
 Output format:
-1. A short prose plan.
-2. A JSON block between `DOWNSTREAM_EXECUTION_CONTRACT_JSON` and
-   `END_DOWNSTREAM_EXECUTION_CONTRACT_JSON`.
-3. A Python code block between `DOWNSTREAM_PYTHON_SCRIPT` and
+1. A short prose plan of no more than 150 words.
+2. One Python code block between `DOWNSTREAM_PYTHON_SCRIPT` and
    `END_DOWNSTREAM_PYTHON_SCRIPT`.
    Put the marker labels on their own lines and do not omit them.
+
+Do not emit a long JSON block outside the Python script. Long preambles can
+truncate the generated code before the end marker, which makes the run fail.
+The script itself should define a compact execution-contract dictionary and
+write it to `analysis_outputs/downstream/downstream_execution_contract.json`.

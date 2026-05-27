@@ -1894,8 +1894,9 @@ class ScRTAWorkflow:
             (
                 "Design and implement the selected-hypothesis downstream analysis after reading RAG, "
                 "dataset reconnaissance outputs, deep-dive results, biological interpretation, and mechanism mapping. "
-                "Do not rely on a fixed downstream template. Output a hypothesis-specific execution contract and a "
+                "Do not rely on a fixed downstream template. Keep the response concise: write a short plan, then a "
                 "complete standalone Python script between DOWNSTREAM_PYTHON_SCRIPT and END_DOWNSTREAM_PYTHON_SCRIPT. "
+                "Do not emit a long JSON block outside the script; the script itself should write the execution contract. "
                 "Do not force pseudobulk, pathway, repertoire, clone-state, same-clone, or receptor modules. "
                 "Consider scTCR because this is a paired dataset, but include only scTCR analyses that are "
                 "scientifically relevant to the selected hypothesis and feasible from available outputs."
@@ -1914,19 +1915,15 @@ class ScRTAWorkflow:
         )
         responses.append(downstream_analyst)
 
-        try:
-            script_text = render_downstream_analysis_script(state.run_dir, downstream_analyst.content)
-        except ValueError as exc:
-            path = store.write_markdown(
-                "hypothesis_downstream_execution",
-                (
-                    "# Hypothesis Downstream Analysis Execution\n\n"
-                    "Failed before execution because the downstream_analyst did not emit a valid Python script block.\n\n"
-                    f"Error: {exc}\n"
-                ),
-            )
-            self._add_artifact(state, "hypothesis_downstream_execution", path)
-            raise
+        script_text, format_repair_responses = self._render_downstream_script_with_format_repair(
+            team=team,
+            store=store,
+            state=state,
+            downstream_context=downstream_context,
+            rag_chunks=rag_chunks,
+            initial_response=downstream_analyst,
+        )
+        responses.extend(format_repair_responses)
         script_path = store.write_script("hypothesis_downstream_analysis.py", script_text)
         self._add_artifact(state, "hypothesis_downstream_script", script_path)
         status_path = self._execute_downstream_analysis_with_llm_repair(
@@ -1967,6 +1964,80 @@ class ScRTAWorkflow:
                 )
             )
         return responses
+
+    def _render_downstream_script_with_format_repair(
+        self,
+        team: ScRTATeam,
+        store: ArtifactStore,
+        state: WorkflowState,
+        downstream_context: dict,
+        rag_chunks: list,
+        initial_response: AgentResponse,
+    ) -> tuple[str, list[AgentResponse]]:
+        """Extract downstream Python, retrying once or more if the LLM omitted markers."""
+        repair_responses: list[AgentResponse] = []
+        current_response = initial_response
+        max_format_repairs = max(1, int(self.config.repair_attempts or 0))
+        last_error: Exception | None = None
+
+        for attempt in range(max_format_repairs + 1):
+            try:
+                return render_downstream_analysis_script(state.run_dir, current_response.content), repair_responses
+            except Exception as exc:
+                last_error = exc
+                if attempt >= max_format_repairs:
+                    break
+
+                repair_index = attempt + 1
+                repair_context = dict(downstream_context)
+                repair_context["invalid_downstream_analyst_output"] = truncate_text(current_response.content, 18000)
+                repair_context["script_extraction_error"] = str(exc)
+                repair_context["format_repair_requirement"] = "\n".join(
+                    [
+                        "The previous downstream_analyst response could not be executed because the workflow could not extract a valid Python script.",
+                        "Return only one complete standalone Python script between the exact marker labels below.",
+                        "Do not include a long prose plan, markdown tables, or an external JSON block outside the script.",
+                        "The script must write downstream_analysis_plan.md, downstream_execution_contract.json, downstream_analysis_summary.md, downstream_analysis_summary.json, and downstream_result_manifest.json.",
+                        "Use only local files under analysis_outputs/ and write only under analysis_outputs/downstream/.",
+                        "Keep scTCR conservative and include skipped-reason records when a hypothesis-specific analysis cannot be run.",
+                        "Required start marker: DOWNSTREAM_PYTHON_SCRIPT",
+                        "Required end marker: END_DOWNSTREAM_PYTHON_SCRIPT",
+                    ]
+                )
+                current_response = self._call_and_store(
+                    team,
+                    store,
+                    state,
+                    "downstream_analyst",
+                    (
+                        "Repair the previous downstream_analyst output format. The analysis idea may stay the same, "
+                        "but the response must be executable by the workflow. Return a concise complete Python script "
+                        "between DOWNSTREAM_PYTHON_SCRIPT and END_DOWNSTREAM_PYTHON_SCRIPT, with no other code blocks."
+                    ),
+                    self._context_with_rag(
+                        repair_context,
+                        rag_chunks,
+                        "repair downstream analyst output format missing Python markers concise executable script scRNA scTCR",
+                        store=store,
+                        state=state,
+                        agent_name=f"downstream_analyst_format_repair_{repair_index}",
+                    ),
+                    artifact_name=f"agent_downstream_analyst_format_repair_{repair_index}",
+                )
+                repair_responses.append(current_response)
+
+        path = store.write_markdown(
+            "hypothesis_downstream_execution",
+            (
+                "# Hypothesis Downstream Analysis Execution\n\n"
+                "Failed before execution because downstream_analyst did not emit an extractable Python script "
+                "after automatic format repair.\n\n"
+                f"Last error: {last_error}\n"
+            ),
+        )
+        self._add_artifact(state, "hypothesis_downstream_execution", path)
+        assert last_error is not None
+        raise last_error
 
     def _maybe_execute_deep_dive_script(
         self, store: ArtifactStore, state: WorkflowState, script_path: Path
