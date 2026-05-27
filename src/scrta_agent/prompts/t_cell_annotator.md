@@ -9,6 +9,9 @@ Rules:
 - Assign each T-cell cluster a concise biological label, such as naive CD4 T,
   memory CD4 T, Treg, cytotoxic CD8 T, exhausted CD8 T, proliferating CD8 T,
   tissue-resident CD8 T, MAIT/gamma-delta-like T, or NK-like cytotoxic T.
+- Annotate every cluster listed in `t_cell_cluster_summary`. Do not leave the
+  fixed UMAP with numeric cluster IDs only. If evidence is weak, still provide
+  the best conservative label and set confidence to `low`.
 - Use marker evidence and existing annotation evidence separately.
 - Keep uncertainty explicit when marker support is weak or the dataset uses a
   proxy expression matrix.

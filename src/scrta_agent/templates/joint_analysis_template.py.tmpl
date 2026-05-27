@@ -72,6 +72,7 @@ GROUP_CANDIDATES = [
     "scrta_timepoint",
     "scrta_tissue",
     "scrta_condition",
+    "scrta_sample_group",
     "scrta_sample",
     "scrta_patient",
     "sample",
@@ -338,6 +339,28 @@ def parse_tissue(text: str) -> str:
     return ""
 
 
+def parse_sample_group(text: str) -> str:
+    label = clean_label(text)
+    if not label:
+        return ""
+    core = re.sub(r"(?i)^GSM[0-9]+[_-]?", "", label)
+    core = re.sub(r"(?i)^SRR[0-9]+[_-]?", "", core)
+    parts = [p for p in re.split(r"[-_]+", core) if p]
+    if len(parts) >= 2 and re.search(r"[A-Za-z]", parts[0]) and re.search(r"[A-Za-z]", parts[1]):
+        # Cohorts commonly encode group before patient/sample index, e.g. OM-HL-014-C8.
+        return f"{parts[0]}-{parts[1]}"
+    low = core.lower()
+    if re.search(r"\b(responder|response|sensitive)\b", low):
+        return "responder"
+    if re.search(r"\b(nonresponder|non_response|resistant|refractory)\b", low):
+        return "nonresponder"
+    if re.search(r"\b(control|healthy|normal)\b", low):
+        return "control"
+    if re.search(r"\b(disease|case|patient|sle|hcc|tumou?r|cancer)\b", low):
+        return "disease"
+    return ""
+
+
 def parse_sample_metadata(adata) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     obs = adata.obs
     obs_columns = [str(c) for c in obs.columns]
@@ -357,6 +380,7 @@ def parse_sample_metadata(adata) -> tuple[list[dict[str, object]], list[dict[str
     parsed_time = []
     parsed_tissue = []
     parsed_condition = []
+    parsed_sample_group = []
 
     for idx, cell in enumerate(adata.obs_names):
         record = obs.iloc[idx]
@@ -365,11 +389,13 @@ def parse_sample_metadata(adata) -> tuple[list[dict[str, object]], list[dict[str
         timepoint = first_nonempty(metadata_value_if_not_path(record.get(time_col, "")) if time_col else "", parse_timepoint(sample), parse_timepoint(cell))
         tissue = first_nonempty(metadata_value_if_not_path(record.get(tissue_col, "")) if tissue_col else "", parse_tissue(sample), parse_tissue(cell))
         condition = first_nonempty(metadata_value_if_not_path(record.get(condition_col, "")) if condition_col else "")
+        sample_group = first_nonempty(condition, tissue, timepoint, parse_sample_group(sample))
         parsed_patient.append(patient)
         parsed_sample.append(sample)
         parsed_time.append(timepoint)
         parsed_tissue.append(tissue)
         parsed_condition.append(condition)
+        parsed_sample_group.append(sample_group)
         rows.append(
             {
                 "cell": str(cell),
@@ -378,6 +404,7 @@ def parse_sample_metadata(adata) -> tuple[list[dict[str, object]], list[dict[str
                 "scrta_timepoint": timepoint,
                 "scrta_tissue": tissue,
                 "scrta_condition": condition,
+                "scrta_sample_group": sample_group,
             }
         )
 
@@ -386,9 +413,10 @@ def parse_sample_metadata(adata) -> tuple[list[dict[str, object]], list[dict[str
     adata.obs["scrta_timepoint"] = parsed_time
     adata.obs["scrta_tissue"] = parsed_tissue
     adata.obs["scrta_condition"] = parsed_condition
+    adata.obs["scrta_sample_group"] = parsed_sample_group
 
     summary_rows = []
-    for col in ["scrta_patient", "scrta_sample", "scrta_timepoint", "scrta_tissue", "scrta_condition"]:
+    for col in ["scrta_patient", "scrta_sample", "scrta_timepoint", "scrta_tissue", "scrta_condition", "scrta_sample_group"]:
         values = [clean_label(x) or "unparsed" for x in adata.obs[col].tolist()]
         counter = Counter(values)
         for value, count in counter.most_common(80):
@@ -680,7 +708,11 @@ def patient_blocked_stats(adata, state_columns: list[str]) -> tuple[list[dict[st
     if "scrta_patient" not in obs:
         return [], [{"status": "skipped", "reason": "scrta_patient missing"}]
 
-    contrast_cols = [c for c in ["scrta_timepoint", "scrta_tissue", "scrta_condition"] if c in obs and obs[c].astype(str).str.len().sum() > 0]
+    contrast_cols = [
+        c
+        for c in ["scrta_condition", "scrta_tissue", "scrta_timepoint", "scrta_sample_group"]
+        if c in obs and len([v for v in set(clean_label(x) for x in obs[c].tolist()) if v]) >= 2
+    ]
     score_cols = [c for c in obs.columns if str(c).startswith("scrta_score_")]
     summary_rows = []
     test_rows = []
@@ -754,7 +786,7 @@ def clone_size_aware_null_tests(adata, state_columns: list[str], n_perm: int = 5
 
     rng = random.Random(13)
     candidate_cols = [c for c in state_columns if c in obs]
-    candidate_cols.extend([c for c in ["scrta_timepoint", "scrta_tissue", "scrta_condition"] if c in obs and c not in candidate_cols])
+    candidate_cols.extend([c for c in ["scrta_condition", "scrta_tissue", "scrta_timepoint", "scrta_sample_group"] if c in obs and c not in candidate_cols])
     expanded_by_pos = [(int(x) > 1) for x in obs["scrta_clone_size"].tolist()]
     if len(obs) > 50000:
         n_perm = min(n_perm, 8)
@@ -890,7 +922,7 @@ def within_state_cd8_treg_analysis(adata, state_columns: list[str]) -> tuple[lis
     infer_cd8_treg_states(adata, state_columns)
     obs = adata.obs
     score_cols = [c for c in obs.columns if str(c).startswith("scrta_score_")]
-    contrast_cols = [c for c in ["scrta_tissue", "scrta_timepoint", "scrta_condition", "scrta_clone_size_bin"] if c in obs]
+    contrast_cols = [c for c in ["scrta_condition", "scrta_tissue", "scrta_timepoint", "scrta_sample_group", "scrta_clone_size_bin"] if c in obs]
     signature_rows = []
     de_rows = []
 
@@ -948,9 +980,15 @@ def within_state_cd8_treg_analysis(adata, state_columns: list[str]) -> tuple[lis
 
 def clone_sharing_matrix(adata) -> list[dict[str, object]]:
     obs = adata.obs
-    group_col = "scrta_sample" if "scrta_sample" in obs else None
+    group_col = None
+    for candidate in ["scrta_condition", "scrta_tissue", "scrta_timepoint", "scrta_sample_group"]:
+        if candidate in obs:
+            levels = [v for v, n in Counter(clean_label(x) for x in obs[candidate].tolist()).most_common(20) if v and n >= 20]
+            if len(levels) >= 2:
+                group_col = candidate
+                break
     if not group_col:
-        return [{"status": "skipped", "reason": "sample labels missing"}]
+        return [{"status": "skipped", "reason": "no eligible non-sample group labels for clone sharing"}]
     groups = [g for g, n in Counter(clean_label(x) for x in obs[group_col].tolist()).most_common(30) if g]
     clone_sets = {}
     for group in groups:
@@ -1097,14 +1135,18 @@ def build_occupied_clonotypes_by_group(adata_subset, cluster_col: str) -> list[d
     obs = adata_subset.obs.copy()
     if "scrta_clone_id" not in obs or "scrta_clone_size_bin" not in obs:
         return [{"status": "skipped", "reason": "clone columns unavailable"}]
+    candidate_group_cols = ["scrta_condition", "scrta_tissue", "scrta_timepoint", "scrta_sample_group"]
+    biological_group_cols = []
+    for col in candidate_group_cols:
+        if col not in obs:
+            continue
+        levels = [v for v, n in Counter(clean_label(x) for x in obs[col].tolist()).most_common(20) if v and n >= 20]
+        if len(levels) >= 2:
+            biological_group_cols.append(col)
     group_cols = [
         col
         for col in [
-            "scrta_condition",
-            "scrta_tissue",
-            "scrta_timepoint",
-            "scrta_sample",
-            "scrta_patient",
+            *biological_group_cols,
             cluster_col,
             "sub_cell_type",
             "cell_type",
@@ -1136,10 +1178,10 @@ def build_occupied_clonotypes_by_group(adata_subset, cluster_col: str) -> list[d
                         "cells_in_bin": int(clone_cells.get(clone_bin, 0)),
                         "total_occupied_clonotypes_in_group": total_clones,
                         "fraction_occupied_clonotypes": float(occupied / max(total_clones, 1)),
-                        "method": "occupiedscRepertoire-like count of unique clonotypes per group and clone-size bin",
+                        "method": "occupiedscRepertoire-like count of unique clonotypes per biological group or T-cell state and clone-size bin",
                     }
                 )
-    return rows or [{"status": "skipped", "reason": "no occupied clonotypes available"}]
+    return rows or [{"status": "skipped", "reason": "no occupied clonotypes available for non-sample group or T-cell state labels"}]
 
 
 def plot_occupied_clonotypes_by_group(occupied_rows: list[dict[str, object]]) -> list[str]:
@@ -1165,10 +1207,10 @@ def plot_occupied_clonotypes_by_group(occupied_rows: list[dict[str, object]]) ->
         "scrta_condition",
         "scrta_tissue",
         "scrta_timepoint",
-        "scrta_sample",
-        "scrta_patient",
+        "scrta_sample_group",
         "scrta_t_cell_cluster",
         "cell_type",
+        "sub_cell_type",
     ]
     groupings = [g for g in group_priority if g in set(df["grouping_column"].astype(str))]
     groupings.extend(
@@ -1243,7 +1285,18 @@ def write_t_cell_umap_coordinates(adata_subset, cluster_col: str) -> None:
             "t_cell_cluster": adata_subset.obs[cluster_col].astype(str).to_numpy(),
         }
     )
-    for col in ["sub_cell_type", "cell_type", "scrta_clone_id", "scrta_clone_size", "scrta_clone_size_bin", "scrta_condition", "scrta_tissue", "scrta_patient"]:
+    for col in [
+        "sub_cell_type",
+        "cell_type",
+        "scrta_clone_id",
+        "scrta_clone_size",
+        "scrta_clone_size_bin",
+        "scrta_condition",
+        "scrta_tissue",
+        "scrta_timepoint",
+        "scrta_sample_group",
+        "scrta_patient",
+    ]:
         if col in adata_subset.obs:
             coords[col] = adata_subset.obs[col].astype(str).to_numpy()
     coords.to_csv(OUTPUT_DIR / "t_cell_umap_coordinates.csv", index=False)
@@ -1276,6 +1329,9 @@ def plot_t_cell_umaps(adata_subset, cluster_col: str) -> list[str]:
         "scrta_clone_size_bin",
         "scrta_top_clonotype_label",
         "scrta_condition",
+        "scrta_tissue",
+        "scrta_timepoint",
+        "scrta_sample_group",
     ]
     for color in [c for c in colors if c in adata_subset.obs]:
         try:
@@ -1357,8 +1413,8 @@ def make_figures(adata, state_columns: list[str]) -> list[str]:
 
     colors = [
         "scrta_tissue",
-        "scrta_patient",
-        "scrta_sample",
+        "scrta_condition",
+        "scrta_sample_group",
         "scrta_timepoint",
         "scrta_tcr_matched",
         "scrta_clone_size_bin",
@@ -1411,6 +1467,7 @@ def main() -> None:
             "scrta_t_state",
             "scrta_is_t_cell",
             "scrta_t_cell_cluster",
+            "scrta_sample_group",
             "scrta_tcr_matched",
             "scrta_clone_id",
             "scrta_clone_size",
@@ -1455,6 +1512,7 @@ def main() -> None:
             "scrta_timepoint",
             "scrta_tissue",
             "scrta_condition",
+            "scrta_sample_group",
         ],
         "dataset_reconnaissance_contract": DATASET_RECONNAISSANCE_CONTRACT,
         "embedding_messages": embedding_messages,
@@ -1511,7 +1569,7 @@ def main() -> None:
         "- T-cell extraction followed by T-cell-only graph clustering and UMAP.",
         "- T-cell cluster marker summary for LLM-based T-cell subcluster annotation.",
         "- Clone-size bins use scRepertoire-like thresholds: Single=1, Small=2-5, Medium=6-20, Large=21-100, Hyperexpanded>100.",
-        "- occupiedscRepertoire-like table counts occupied clonotypes by group and clone-size bin.",
+        "- occupiedscRepertoire-like table counts occupied clonotypes by biological group or T-cell state and clone-size bin; individual samples are not used as the primary comparison axis.",
         "",
         "## Conservative Interpretation Rules",
         "- Treat RNA state/program findings as the lead signal.",

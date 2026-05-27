@@ -25,6 +25,12 @@ Critical sequencing rule:
 Figure design rules:
 - Make the selected biological hypothesis the organizing principle.
 - Do not reuse a fixed figure sequence across datasets.
+- Prefer figures that compare biological/sample groups, not individual samples.
+  Use result columns such as `scrta_condition`, `scrta_tissue`,
+  `scrta_timepoint`, `scrta_sample_group`, `contrast`, `group`, `group_a`, and
+  `group_b` when they encode real multi-sample groups. Avoid plots whose main
+  x-axis is `scrta_sample`, `sample_id`, or individual patient IDs unless the
+  selected hypothesis is explicitly sample- or patient-specific.
 - Do not turn every table into a bar chart. Choose the plot type from the data
   and the claim: UMAP/image panels for state architecture, violin/box/strip
   plots for distributions, heatmaps for matrix-like occupancy or program

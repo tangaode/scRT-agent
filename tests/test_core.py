@@ -105,6 +105,20 @@ def test_rendered_analysis_script_guards_path_labels(tmp_path: Path) -> None:
     assert 'kind="barh"' in script
 
 
+def test_rendered_analysis_script_prefers_group_over_sample_comparisons(tmp_path: Path) -> None:
+    config = WorkflowConfig(
+        rna_h5ad_path=str(tmp_path / "rna.h5ad"),
+        tcr_path=str(tmp_path / "tcr.csv"),
+        analysis_name="group_comparison_test",
+        output_root=str(tmp_path),
+    )
+    script = render_joint_analysis_script(config, tmp_path)
+
+    assert "scrta_sample_group" in script
+    assert "individual samples are not used as the primary comparison axis" in script
+    assert "no eligible non-sample group labels for clone sharing" in script
+
+
 def test_rendered_deep_dive_script_compiles(tmp_path: Path) -> None:
     selection = DeepDiveSelection(
         hypothesis_id="HYP-1",

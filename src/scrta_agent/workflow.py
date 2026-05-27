@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import asdict
 import json
 from pathlib import Path
+import re
 import shutil
 from typing import Callable
 
@@ -379,6 +381,7 @@ class ScRTAWorkflow:
                     "6. Do not rely on the old publication_figure_spec renderer or any fixed figure template.",
                     "7. Never plot full file paths as labels. Convert path-like values to short sample IDs.",
                     "8. Keep category labels and legends readable; cap or aggregate overcrowded categories.",
+                    "9. Prefer group-level contrasts (`scrta_condition`, `scrta_tissue`, `scrta_timepoint`, `scrta_sample_group`) over per-sample plots.",
                 ]
             )
             visualizer = self._call_and_store(
@@ -397,6 +400,7 @@ class ScRTAWorkflow:
                     "Do not use a fixed figure template, fixed renderer, or JSON figure spec. "
                     "Do not use full file paths or matrix filenames as group labels; sanitize "
                     "path-like values into concise sample IDs and avoid overcrowded legends. "
+                    "Do not make individual sample IDs the main comparison axis unless the selected hypothesis is explicitly sample-specific. "
                     "Return the full executable script between PUBLICATION_FIGURE_PYTHON_SCRIPT "
                     "and END_PUBLICATION_FIGURE_PYTHON_SCRIPT."
                 ),
@@ -1683,7 +1687,126 @@ class ScRTAWorkflow:
         annotation_copy = output_dir / "t_cell_subcluster_annotation.md"
         annotation_copy.write_text(response.content.strip() + "\n", encoding="utf-8")
         self._add_artifact(state, "t_cell_subcluster_annotation_output", annotation_copy)
+        self._materialize_t_cell_annotation_outputs(output_dir, response, state)
         return response
+
+    def _materialize_t_cell_annotation_outputs(
+        self,
+        output_dir: Path,
+        response: AgentResponse,
+        state: WorkflowState,
+    ) -> None:
+        match = re.search(
+            r"T_CELL_ANNOTATION_JSON\s*(\{.*?\})\s*END_T_CELL_ANNOTATION_JSON",
+            response.content or "",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return
+        try:
+            payload = json.loads(match.group(1))
+        except Exception:
+            return
+        annotations = payload.get("annotations")
+        if not isinstance(annotations, list):
+            return
+        clean_rows: list[dict[str, str]] = []
+        for item in annotations:
+            if not isinstance(item, dict):
+                continue
+            cluster = str(item.get("t_cell_cluster", "")).strip()
+            label = str(item.get("label", "")).strip()
+            if not cluster or not label:
+                continue
+            clean_rows.append(
+                {
+                    "t_cell_cluster": cluster,
+                    "llm_t_cell_subtype": label,
+                    "major_lineage": str(item.get("major_lineage", "")).strip(),
+                    "confidence": str(item.get("confidence", "")).strip(),
+                    "marker_rationale": str(item.get("marker_rationale", "")).strip(),
+                    "existing_annotation_support": str(item.get("existing_annotation_support", "")).strip(),
+                    "sctcr_note": str(item.get("sctcr_note", "")).strip(),
+                }
+            )
+        if not clean_rows:
+            return
+
+        json_path = output_dir / "t_cell_subcluster_annotation.json"
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._add_artifact(state, "t_cell_subcluster_annotation_json", json_path)
+
+        csv_path = output_dir / "t_cell_subcluster_annotations.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(clean_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(clean_rows)
+        self._add_artifact(state, "t_cell_subcluster_annotations", csv_path)
+
+        coords_path = output_dir / "t_cell_umap_coordinates.csv"
+        if not coords_path.exists():
+            return
+        try:
+            import matplotlib.pyplot as plt
+            import pandas as pd
+        except Exception:
+            return
+
+        try:
+            coords = pd.read_csv(coords_path)
+        except Exception:
+            return
+        required = {"UMAP1", "UMAP2", "t_cell_cluster"}
+        if coords.empty or not required.issubset(set(coords.columns)):
+            return
+        mapping = {row["t_cell_cluster"]: row for row in clean_rows}
+        coords["llm_t_cell_subtype"] = [
+            mapping.get(str(cluster), {}).get("llm_t_cell_subtype", f"Cluster {cluster}")
+            for cluster in coords["t_cell_cluster"].astype(str)
+        ]
+        coords["llm_major_lineage"] = [
+            mapping.get(str(cluster), {}).get("major_lineage", "")
+            for cluster in coords["t_cell_cluster"].astype(str)
+        ]
+        annotated_path = output_dir / "t_cell_umap_coordinates_annotated.csv"
+        coords.to_csv(annotated_path, index=False)
+        self._add_artifact(state, "t_cell_umap_coordinates_annotated", annotated_path)
+
+        fig_dir = output_dir / "figures"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+        labels = list(coords["llm_t_cell_subtype"].dropna().astype(str).unique())
+        labels = sorted(labels)
+        palette = plt.get_cmap("tab20")
+        fig, ax = plt.subplots(figsize=(7.4, 6.2))
+        for index, label in enumerate(labels):
+            sub = coords[coords["llm_t_cell_subtype"].astype(str) == label]
+            ax.scatter(
+                sub["UMAP1"],
+                sub["UMAP2"],
+                s=4 if len(coords) <= 50000 else 2,
+                alpha=0.75,
+                color=palette(index % 20),
+                linewidths=0,
+                label=label,
+            )
+        centers = coords.groupby("llm_t_cell_subtype", dropna=False)[["UMAP1", "UMAP2"]].median()
+        for label, row in centers.iterrows():
+            ax.text(row["UMAP1"], row["UMAP2"], str(label), fontsize=7, ha="center", va="center")
+        ax.set_title("T-cell UMAP annotated by LLM-defined subtypes")
+        ax.set_xlabel("UMAP1")
+        ax.set_ylabel("UMAP2")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        if len(labels) <= 12:
+            ax.legend(frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left", markerscale=2)
+        fig.tight_layout()
+        png_path = fig_dir / "t_cell_umap_llm_subtypes.png"
+        pdf_path = fig_dir / "t_cell_umap_llm_subtypes.pdf"
+        fig.savefig(png_path, dpi=220, bbox_inches="tight")
+        fig.savefig(pdf_path, bbox_inches="tight")
+        plt.close(fig)
+        self._add_artifact(state, "t_cell_umap_llm_subtypes_png", png_path)
+        self._add_artifact(state, "t_cell_umap_llm_subtypes_pdf", pdf_path)
 
     def _run_biology_mechanism_loop(
         self,

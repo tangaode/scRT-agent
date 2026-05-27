@@ -37,6 +37,11 @@ Deep-dive analysis rules:
 - Prefer patient/sample-level aggregation for condition, tissue, treatment, or
   response comparisons. Cell-level summaries may be descriptive but should not
   be the only support for a strong claim.
+- Distinguish biological/sample-group comparisons from per-sample summaries.
+  Prefer `scrta_condition`, `scrta_tissue`, `scrta_timepoint`, or
+  `scrta_sample_group` as comparison axes. Do not use `scrta_sample` or
+  individual patient IDs as the primary biological contrast unless the selected
+  hypothesis explicitly concerns one patient/sample.
 - If a decisive analysis cannot be run from local outputs, record it as skipped
   with a concrete reason. Do not create fake evidence tables.
 - Include stopping rules: supported, partially supported, not supported, or

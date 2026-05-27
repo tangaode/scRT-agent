@@ -48,6 +48,13 @@ Rules:
    the biological comparison. If a planned analysis cannot be run from local
    outputs, record it as skipped in the markdown/json summary rather than
    creating a fake or empty figure-oriented table.
+5. Prefer group-level comparisons over per-sample displays. Use
+   `scrta_condition`, `scrta_tissue`, `scrta_timepoint`, and
+   `scrta_sample_group` as the primary comparison axes when they have at least
+   two non-empty levels. Do not make `scrta_sample` or individual patient IDs
+   the main analysis axis unless the selected hypothesis explicitly concerns a
+   single sample or patient. Per-sample summaries may be used only as
+   patient/sample-level support for a group-level claim.
 
 Script requirements:
 - Emit exactly one Python script between `DOWNSTREAM_PYTHON_SCRIPT` and
@@ -75,7 +82,9 @@ Script requirements:
 - Do not install packages, do not download data, and do not write outside
   `analysis_outputs/downstream/`.
 - Prefer robust pandas/numpy summaries over brittle model fitting. Use
-  patient-level or sample-level aggregation when comparing clinical groups.
+  patient-level or sample-level aggregation when comparing clinical groups, but
+  report the final comparison at the group level rather than as one panel per
+  sample.
 
 Output format:
 1. A short prose plan of no more than 150 words.
